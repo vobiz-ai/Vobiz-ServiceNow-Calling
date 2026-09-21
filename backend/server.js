@@ -381,9 +381,8 @@ function toE164(raw) {
   return digits ? `+${digits}` : "";
 }
 
-// Origins allowed to drive this backend. A wildcard — what this used to send —
-// lets any page on the internet read what this server exposes and place calls
-// billed to the account.
+// Origins allowed to drive this backend. A wildcard would let any page on the
+// internet read what this server exposes and place calls billed to the account.
 //
 // ServiceNow serves OpenFrame and the agent workspace from the customer's own
 // *.service-now.com instance; ALLOWED_ORIGINS adds anything else you host the
@@ -726,9 +725,9 @@ const server = http.createServer(async (req, res) => {
         return res.end(JSON.stringify({ error: "agentId, authId and authToken are required" }));
       }
 
-      // Credentials are proven, not assumed. The check used to be skipped
-      // entirely when the server had no VOBIZ_AUTH_ID configured, which signed
-      // in anyone who typed anything.
+      // Credentials are proven, not assumed — including when this server is
+      // not bound to an account, where the temptation is to accept anything
+      // that looks like a key.
       let isValid = false;
       if (VOBIZ_AUTH_ID && authId === VOBIZ_AUTH_ID && authToken === VOBIZ_AUTH_TOKEN) {
         isValid = true;
@@ -784,11 +783,10 @@ const server = http.createServer(async (req, res) => {
 
   // The bearer token is the only thing that identifies a session.
   //
-  // /session/<agentId> used to answer from any live session whose agent id
-  // matched, with no token at all — so guessing an agent id (they are ServiceNow
-  // usernames) returned that session's account auth ID and the account's phone
-  // numbers. The path form is kept so old widgets do not 404, but it proves
-  // nothing on its own.
+  // The /session/<agentId> form is accepted so older widgets do not 404, but the
+  // id in the path proves nothing on its own: agent ids are ServiceNow
+  // usernames, so answering from them would hand the account's Auth ID and
+  // phone numbers to anyone who can guess one.
   if (pathname === "/session" || pathname.startsWith("/session/")) {
     const s = getSession(req);
     if (s) {
@@ -819,9 +817,8 @@ const server = http.createServer(async (req, res) => {
       const cleanUser = String(sipUser).replace(/^sip:/, "").split("@")[0];
 
       // The caller ID is what the customer's handset displays and what the
-      // carrier bills against. Accepting an arbitrary string here let anyone
-      // who could reach the tunnel set the number this account dials out as.
-      // It has to be a number the account actually owns.
+      // carrier bills against, so it has to be a number the account actually
+      // owns. An arbitrary string here is caller-ID spoofing on the account.
       const numRes = await vobiz("GET", "/numbers?per_page=50");
       const owned = (((numRes.body && (numRes.body.objects || numRes.body.items)) || [])
         .map((n) => n.e164 || n.number || n.phone_number)
@@ -840,7 +837,7 @@ const server = http.createServer(async (req, res) => {
       // A session scoped to SIP-direct mode. It carries no account credentials
       // and /agent refuses it: an agent signing in this way already holds their
       // own SIP password, and serving the account's password to anyone who can
-      // name an endpoint and a DID would be the /agent hole by another door.
+      // name an endpoint and a DID would defeat the point of gating it.
       const token = newSession(cleanUser, null, [callerId], callerId);
       sessions.get(token).mode = "sip";
 
@@ -873,11 +870,10 @@ const server = http.createServer(async (req, res) => {
 
   // SIP credentials for the softphone to register with.
   //
-  // Behind the session deliberately. SIP credentials let anyone place calls
-  // billed to this account. This route used to serve them to any caller, for
-  // any agent id — an unknown id fell through to a manufactured agent carrying
-  // the real VOBIZ_SIP_PASSWORD, so `GET /agent/anyone` returned the password
-  // in plaintext, with CORS wide open.
+  // Behind the session deliberately: SIP credentials let anyone place calls
+  // billed to this account. An unknown agent id is refused rather than filled in
+  // with a default, because a fallback here means the password is served to
+  // whoever asks.
   if (pathname === "/agent" || pathname.startsWith("/agent/")) {
     const session = getSession(req);
     if (!session) {
@@ -957,9 +953,9 @@ const server = http.createServer(async (req, res) => {
 
     // These links live in ServiceNow work notes, so they are opened by a
     // browser with no session. A valid signature is the proof; a signed-in
-    // caller from the softphone is the other accepted proof. Neither used to be
-    // required, and an unmatched UUID fell through to "the account's most
-    // recent recording" — which handed any passer-by call audio.
+    // caller from the softphone is the other accepted proof. A link that cannot
+    // be resolved to its own call is refused — never answered with whatever
+    // recording is most recent.
     const signedFor = callUuid || recordingId;
     if (!verifyRecordingSignature(signedFor, queryParams.exp, queryParams.sig) && !getSession(req)) {
       res.writeHead(403, { "Content-Type": "application/json" });
@@ -1024,18 +1020,16 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // GET /recording-file?url=… is gone.
+  // GET /recording-file?url=… is deliberately not implemented, and says so.
   //
-  // It took a fully caller-controlled URL and fetched it with the account's
-  // Vobiz credentials attached:
+  // Fetching a caller-supplied URL with the account credentials attached —
   //
   //     await fetch(targetUrl, { headers: { "X-Auth-ID": …, "X-Auth-Token": … } })
   //
-  // That is a credential-exfiltration primitive, not merely SSRF — unauthenticated,
-  // CORS-open, and it would post the account Auth Token to any host a caller
-  // named. Verified live: pointing it at a listener returned both headers.
-  // Playback now goes through /recording-audio/<id>, which resolves the media
-  // URL server-side and demands a signature.
+  // — is a credential-exfiltration primitive, not merely SSRF: it posts the
+  // account Auth Token to any host a caller names. Playback goes through
+  // /recording-audio/<id>, which takes an id, resolves the media URL
+  // server-side, and demands a signature.
   if (pathname === "/recording-file") {
     res.writeHead(410, { "Content-Type": "application/json" });
     return res.end(
@@ -1090,10 +1084,10 @@ const server = http.createServer(async (req, res) => {
     try {
       const publicBaseUrl = getPublicBaseUrl();
       const body = await readJsonBody(req);
-      // This route spends money: it originates a call on the account. It used
-      // to be open whenever VOBIZ_SHARED_SECRET happened to be unset, which is
-      // the default. A caller must now present either the shared secret that
-      // the ServiceNow UI Action sends, or a softphone session.
+      // This route spends money: it originates a call on the account. A caller
+      // must present either the shared secret the ServiceNow UI Action sends,
+      // or a softphone session — never neither, including when the secret is
+      // simply not configured.
       const providedSecret = req.headers["x-vobiz-secret"] || req.headers["x-api-key"] || body.secret;
       const secretOk = Boolean(VOBIZ_SHARED_SECRET) && providedSecret === VOBIZ_SHARED_SECRET;
       if (!secretOk && !getSession(req)) {
@@ -1148,8 +1142,8 @@ const server = http.createServer(async (req, res) => {
     return res.end(
       JSON.stringify({
         // Health is unauthenticated, so it reports whether things are
-        // configured, never what they are. It used to publish the account
-        // Auth ID, the DID and the SIP username to anyone who asked.
+        // configured, never what they are — publishing the account Auth ID, the
+        // DID or the SIP username here would hand them to anyone who asks.
         ok: true,
         accountConfigured: Boolean(VOBIZ_AUTH_ID && VOBIZ_AUTH_TOKEN),
         callerIdConfigured: Boolean(VOBIZ_FROM_NUMBER),

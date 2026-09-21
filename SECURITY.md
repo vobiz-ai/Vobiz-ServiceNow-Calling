@@ -26,8 +26,7 @@ reach `/answer`. Treat any endpoint on it as internet-facing, because it is.
 
 ## Rules this codebase follows
 
-These are not aspirations. Each one replaced a defect that was reproduced
-against the running server; the test suite fails if any is undone.
+These are enforced by the test suite, which fails if any is undone.
 
 **No credential ever leaves on a caller's instruction.** The recording proxy
 takes a recording *id*, resolves the media URL server-side, and refuses any host
@@ -35,7 +34,7 @@ off an allowlist — checked before the first request and again after every
 redirect, dropping our headers on the way, because a presigned storage URL
 carries its own authorisation. An endpoint that fetches a caller-supplied URL
 with credentials attached is a credential-exfiltration primitive, not merely
-SSRF; it was one here, and CORS was `*`, so any web page could drive it.
+SSRF.
 
 **Playback links prove themselves.** They are HMAC-signed with a short expiry.
 They end up in ServiceNow work notes, where every agent on the instance can read
@@ -43,8 +42,8 @@ them for as long as the record exists, so they must never carry credentials and
 must expire.
 
 **Credentials are proven, not assumed.** Sign-in validates against Vobiz. There
-is no "looks like a key" fallback and no path where an unconfigured server
-accepts anything.
+is no "looks like a key" fallback, including on a server not bound to an
+account.
 
 **Secrets are served only to a session.** SIP credentials come from the
 environment and go only to a signed-in caller. `agents.json` is committed, so it
@@ -67,8 +66,5 @@ shared secret or a session; caller ID must be a number the account owns.
 - Set `VOBIZ_SHARED_SECRET` and the matching `vobiz.calling.shared_secret`
   property — the ServiceNow UI Action cannot place calls without it.
 - Keep `backend/.env` out of git. It is gitignored; check before you force-add.
-- Rotate the Vobiz Auth Token and the SIP password if this service has ever run
-  a version older than 2.0.0 on a public tunnel. The defects above were
-  remotely exploitable without authentication.
 - Prefer a stable hostname over a quick tunnel in production. A quick tunnel
   hostname is reassigned to someone else after you release it.

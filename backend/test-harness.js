@@ -163,7 +163,7 @@ mockVobizServer.listen(MOCK_VOBIZ_PORT, () => {
       assert.ok(sipLoginData.token, "SIP-direct login should return a session token");
       console.log("[test] ✓ Test 2 Passed: SIP direct login succeeded.");
 
-      // Regression: a caller ID the account does not own is caller-ID spoofing.
+      // A caller ID the account does not own is caller-ID spoofing.
       const spoofRes = await fetch(`http://localhost:${BACKEND_PORT}/login-sip`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -236,8 +236,8 @@ mockVobizServer.listen(MOCK_VOBIZ_PORT, () => {
       // Test 6: Softphone agent info lookup
       console.log("[test] Test 6: Verifying softphone /agent/:agentId endpoint...");
 
-      // Regression: this used to serve the real SIP password to any caller, for
-      // any agent id, with CORS wide open.
+      // SIP credentials are never served to an unauthenticated caller, and an
+      // unknown agent id is refused rather than filled in with a default.
       const agentAnon = await fetch(`http://localhost:${BACKEND_PORT}/agent/test-agent`);
       assert.strictEqual(agentAnon.status, 401, "/agent must refuse an unauthenticated caller");
       const agentAnonBody = await agentAnon.text();
@@ -288,33 +288,33 @@ mockVobizServer.listen(MOCK_VOBIZ_PORT, () => {
       assert.strictEqual(startData.call_sid, "mock_call_sid_12345");
       console.log("[test] ✓ Test 8 Passed: /start-call proxy succeeded.");
 
-      // ── Security regressions ──
+      // ── Security properties ──
       //
-      // Each of these was exploitable against the running server. They are
-      // permanent: if any starts passing traffic again, the suite fails.
-      console.log("[test] Test 9: Security regressions...");
+      // Each of these is a guarantee this backend makes. They are permanent: if
+      // any stops holding, the suite fails.
+      console.log("[test] Test 9: Security properties...");
 
-      // The credential-exfiltration proxy. It fetched any URL a caller named
-      // with X-Auth-ID and X-Auth-Token attached.
+      // A media proxy that fetches a caller-supplied URL with the account
+      // credentials attached hands them to whatever host is named.
       const exfil = await fetch(
         `http://localhost:${BACKEND_PORT}/recording-file?url=${encodeURIComponent("http://127.0.0.1:1/steal")}`
       );
-      assert.strictEqual(exfil.status, 410, "/recording-file?url= must be gone, not merely guarded");
+      assert.strictEqual(exfil.status, 410, "/recording-file?url= is not implemented, not merely guarded");
 
-      // signRecordingUrl() emitted exp and sig; nothing verified them.
+      // A playback link carries a signature, and it is checked.
       const unsigned = await fetch(`http://localhost:${BACKEND_PORT}/recording-audio/rec_123`);
       assert.strictEqual(unsigned.status, 403, "/recording-audio must verify the playback signature");
 
       const badSig = await fetch(`http://localhost:${BACKEND_PORT}/recording-audio/rec_123?exp=99999999999&sig=deadbeef`);
       assert.strictEqual(badSig.status, 403, "/recording-audio must reject a forged signature");
 
-      // Unsigned playback links also fell through to "the account's most recent
-      // recording", which handed a stranger call audio.
+      // An unsigned playback link is refused outright, never answered with
+      // whatever recording is most recent.
       const unsignedPlay = await fetch(`http://localhost:${BACKEND_PORT}/play-recording?callUuid=uuid_outbound_test_1`);
       assert.strictEqual(unsignedPlay.status, 403, "/play-recording must demand a signature or a session");
 
-      // Session lookup by agent id needed no token and returned the account's
-      // Auth ID and phone numbers.
+      // An agent id in the path is not a credential: it proves nothing without
+      // a token, and leaks neither the Auth ID nor the account's numbers.
       const sessionByName = await fetch(`http://localhost:${BACKEND_PORT}/session/test-agent`);
       const sessionByNameJson = await sessionByName.json();
       assert.strictEqual(sessionByNameJson.loggedIn, false, "/session/<agentId> must prove nothing without a token");
@@ -333,7 +333,7 @@ mockVobizServer.listen(MOCK_VOBIZ_PORT, () => {
       assert.ok(!healthText.includes("mock_auth_id"), "/health must not publish the account Auth ID");
       assert.ok(!healthText.includes("testuser_abc"), "/health must not publish the SIP username");
 
-      // Wildcard CORS let any page on the internet drive this server.
+      // CORS is an allowlist; a wildcard would let any page drive this server.
       const corsRes = await fetch(`http://localhost:${BACKEND_PORT}/health`, {
         headers: { Origin: "https://evil.example" },
       });
@@ -346,7 +346,7 @@ mockVobizServer.listen(MOCK_VOBIZ_PORT, () => {
         !corsRes.headers.get("access-control-allow-origin"),
         "an unknown origin must not be echoed back as allowed"
       );
-      console.log("[test] ✓ Test 9 Passed: all security regressions held.");
+      console.log("[test] ✓ Test 9 Passed: all security properties held.");
 
       console.log("\n=========================");
       console.log("ALL TESTS PASSED SUCCESSFULLY");

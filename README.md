@@ -4,13 +4,7 @@ A WebRTC softphone inside ServiceNow. Agents call from a record or from the
 OpenFrame panel, talk in the browser, and the call is written back to the
 ServiceNow `interaction` table with a playable recording link.
 
-[Docs](https://docs.vobiz.ai/integrations/servicenow) · [Install](docs/SETUP_GUIDE.md) · [Architecture](docs/ARCHITECTURE.md) · [API](docs/API_SPECIFICATION.md) · [Troubleshooting](docs/TROUBLESHOOTING.md) · [Issues](ISSUES.md) · [Listing](MARKETPLACE.md)
-
-**Status.** The backend, the answer XML and the whole HTTP surface are covered
-by `npm test` — 46 assertions, including a security-regression group that holds
-the fixes in [CHANGELOG 2.1.0](CHANGELOG.md) in place. A live call against a
-production Vobiz account has not been run since those fixes; see
-[ISSUES.md](ISSUES.md#1-no-live-call-since-the-security-rewrite).
+[Docs](https://docs.vobiz.ai/integrations/servicenow) · [Quick start](QUICKSTART.md) · [Install](docs/SETUP_GUIDE.md) · [Architecture](docs/ARCHITECTURE.md) · [API](docs/API_SPECIFICATION.md) · [Troubleshooting](docs/TROUBLESHOOTING.md)
 
 ---
 
@@ -48,9 +42,8 @@ endpoint, and it works.
 | `servicenow-app/sys_properties/` | The two properties the UI Action reads, instead of hardcoded URLs |
 
 The backend writes the interaction record itself, over the ServiceNow Table API,
-using the instance credentials in `.env`. That is the opposite of the HubSpot
-build, where the CRM creates the engagement from the widget's own session — so
-here the ServiceNow user in `.env` needs write access to `interaction`.
+using the instance credentials in `.env`. So the ServiceNow user you configure
+there needs write access to the `interaction` table.
 
 ---
 
@@ -127,25 +120,32 @@ Symptom-driven debugging lives in [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTI
 
 ## Security
 
-Every item below was a live, reproduced defect in this repository before
-2.1.0. Do not reintroduce them.
+This service holds your Vobiz Auth Token, a SIP endpoint password and your
+ServiceNow instance credentials, and it is reachable from the internet because
+Vobiz has to call its webhooks. It is built accordingly.
 
 - **Recording playback is HMAC-signed with a short expiry.** The endpoint takes
   a recording *id*, resolves the media URL server-side, and refuses any host off
-  an allowlist — before the request and again after every redirect. Never
-  reintroduce a caller-supplied URL here: with account credentials attached,
-  that is a credential-exfiltration primitive any web page can drive.
-- **`/agent` is session-gated**, and `agents.json` holds no passwords. SIP
+  an allowlist — before the request and again after every redirect. Never add a
+  caller-supplied URL here: with account credentials attached, that hands them
+  to whatever host is named.
+- **`/agent` is session-gated**, and `agents.json` carries no passwords. SIP
   credentials let anyone place calls billed to the account.
 - **Sign-in proves the credentials** against Vobiz, and the browser holds an
   opaque session token rather than the Auth Token.
 - **CORS is an allowlist** — `*.service-now.com`, localhost, and anything in
-  `ALLOWED_ORIGINS` — not `*`.
+  `ALLOWED_ORIGINS`.
 - **`/health` reports whether things are configured, never what they are.**
-- **`/start-call` requires the shared secret or a session.**
-- **Caller ID must be a number the account owns**, or `/login-sip` refuses it.
+- **`/start-call` requires the shared secret or a session**, because it
+  originates a billed call.
+- **Caller ID must be a number the account owns.**
 
-Report a vulnerability to `support@vobiz.ai` — see [SECURITY.md](SECURITY.md).
+Two settings worth getting right before you go live: set `SIGNING_SECRET`
+explicitly, or playback links stop working at every restart, and set
+`VOBIZ_SHARED_SECRET` with the matching ServiceNow property, or the form button
+cannot place calls.
+
+Found a problem? `support@vobiz.ai` — see [SECURITY.md](SECURITY.md).
 
 ---
 
@@ -156,11 +156,10 @@ npm test
 ```
 
 Starts a backend against a mock Vobiz API, drives both call directions through
-`/answer`, checks the CDR ledger, and then asserts the security regressions:
-that `/recording-file?url=` is gone, that unsigned playback is refused, that
-`/agent` and `/start-call` demand authentication, that `/health` leaks nothing,
-and that an unknown origin is not echoed back as allowed. It exits non-zero when
-any of that stops being true.
+`/answer`, checks the CDR ledger, and asserts the security properties above —
+that unsigned playback is refused, that `/agent` and `/start-call` demand
+authentication, that `/health` reveals nothing, and that an unknown origin is not
+echoed back as allowed. It exits non-zero when any of that stops being true.
 
 ---
 

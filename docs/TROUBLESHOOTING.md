@@ -113,9 +113,9 @@ Open the recording from the softphone's recordings list to get a fresh link.
 
 ## `/recording-file` returns HTTP 410
 
-Deliberate. That endpoint took a caller-supplied URL and fetched it with the
-account credentials attached; it was removed. Use the signed
-`/recording-audio/<recordingId>` link that `/recordings` returns.
+Deliberate: this backend does not proxy a caller-supplied URL, because doing so
+with the account credentials attached would hand them to whatever host is named.
+Use the signed `/recording-audio/<recordingId>` link that `/recordings` returns.
 
 ---
 

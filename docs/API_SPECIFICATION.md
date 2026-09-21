@@ -111,10 +111,10 @@ request.
 
 - `403 Forbidden`: missing, forged or expired signature, and no session.
 
-> **`GET /recording-file?url=` was removed and answers `410 Gone`.** It fetched
-> a caller-supplied URL with `X-Auth-ID` and `X-Auth-Token` attached, which
-> delivered the account credentials to whatever host the caller named. Do not
-> reintroduce a URL parameter here.
+> **`GET /recording-file?url=` is not implemented and answers `410 Gone`.**
+> Fetching a caller-supplied URL with `X-Auth-ID` and `X-Auth-Token` attached
+> delivers the account credentials to whatever host the caller names. Do not add
+> a URL parameter here.
 
 ---
 
