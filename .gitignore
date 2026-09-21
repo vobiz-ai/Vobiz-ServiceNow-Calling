@@ -1,0 +1,18 @@
+# Dependencies
+node_modules/
+backend/node_modules/
+
+# Local Environment Credentials
+backend/.env
+
+# Temporary Tunnel Url
+backend/tunnel-url.txt
+
+# Operating System files
+.DS_Store
+Thumbs.db
+
+# Tunnel binary — install cloudflared, do not commit a 54 MB executable
+backend/cloudflared.exe
+cloudflared
+cloudflared.exe

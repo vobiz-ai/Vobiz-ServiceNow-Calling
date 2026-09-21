@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        node-version: [18.x, 20.x, 22.x]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      # The suite starts its own backend against a mock Vobiz API and exits
+      # non-zero on any failure, including the security regressions.
+      - name: Test suite
+        run: npm test
+
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # A credential in a public repository is a published credential. These
+      # patterns are the shapes that have actually been committed to Vobiz
+      # integrations before.
+      - name: No committed credentials
+        run: |
+          set -e
+          if [ -f backend/.env ]; then echo "backend/.env is committed"; exit 1; fi
+          if grep -rIn '"sipPassword"' --include='*.json' . ; then
+            echo "agents.json is committed; it must not carry a SIP password field"; exit 1
+          fi
+          # The defect was a media fetch whose destination came from the
+          # request. Match that, not the word "recording-file" — the removal
+          # notice and its regression test both mention it by name.
+          if grep -rInE 'queryParams\.url|query\.url' --include='*.js' backend/ ; then
+            echo "a caller-supplied media URL must not come back"; exit 1
+          fi
+          if grep -rIn 'Access-Control-Allow-Origin", "\*"' --include='*.js' backend/ ; then
+            echo "wildcard CORS must not come back"; exit 1
+          fi
+          echo "clean"
