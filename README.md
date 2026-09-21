@@ -4,7 +4,7 @@ A WebRTC softphone inside ServiceNow. Agents call from a record or from the
 OpenFrame panel, talk in the browser, and the call is written back to the
 ServiceNow `interaction` table with a playable recording link.
 
-[Install](docs/SETUP_GUIDE.md) · [Architecture](docs/ARCHITECTURE.md) · [API](docs/API_SPECIFICATION.md) · [Troubleshooting](docs/TROUBLESHOOTING.md) · [Issues](ISSUES.md) · [Listing](MARKETPLACE.md)
+[Docs](https://docs.vobiz.ai/integrations/servicenow) · [Install](docs/SETUP_GUIDE.md) · [Architecture](docs/ARCHITECTURE.md) · [API](docs/API_SPECIFICATION.md) · [Troubleshooting](docs/TROUBLESHOOTING.md) · [Issues](ISSUES.md) · [Listing](MARKETPLACE.md)
 
 **Status.** The backend, the answer XML and the whole HTTP surface are covered
 by `npm test` — 46 assertions, including a security-regression group that holds
