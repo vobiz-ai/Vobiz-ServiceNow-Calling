@@ -54,13 +54,22 @@ refuses looks exactly like a missing session.
 
 ## The ServiceNow **Call via Vobiz** button fails with 401
 
-`/start-call` originates a billed call and is no longer open. Set both:
+`/start-call` makes the agent's softphone place a billed call, so it is not open. Set both:
 
 - `VOBIZ_SHARED_SECRET` in `backend/.env`
 - `vobiz.calling.shared_secret` in ServiceNow `sys_properties`, to the same value
 
 The UI Action sends it as `X-Vobiz-Secret`. With the property empty, no header
 is sent and the backend refuses — which is the intended behaviour, not a bug.
+
+---
+
+## The ServiceNow **Call via Vobiz** button fails with 409
+
+The button does not dial from the backend; it hands the number to your open
+softphone. A `409` means no softphone is open and signed in with the Vobiz
+account (a SIP-direct sign-in does not receive these). Open the panel, sign in,
+wait for **READY**, and press the button again.
 
 ---
 

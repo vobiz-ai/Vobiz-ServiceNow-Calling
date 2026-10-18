@@ -48,11 +48,11 @@ In this architecture:
 │   │     (Validates shared secret) │                          │   (createServiceNowInteraction)      │   │
 │   └───────────────┬───────────────┘                          └──────────────────────▲───────────────┘   │
 │                   │                                                                 │                   │
-│                   │ 2. Outbound REST                                                │ 7. Hangup Event   │
+│                   │ 2. To softphone queue                                           │ 7. Hangup Event   │
 │                   ▼                                                                 │    + Duration     │
 │   ┌───────────────────────────────┐     5. Vobiz XML Dial    ┌──────────────────────┴───────────────┐   │
 │   │   POST /answer Webhook        │◄─────────────────────────┤       POST /hangup-callback          │   │
-│   │   (<Dial><User>sip:agent</User>)                         │       POST /recording-callback       │   │
+│   │   (<Dial><Number> out, <User> in)                        │       POST /recording-callback       │   │
 │   └───────────────────────────────┘                          └──────────────────────▲───────────────┘   │
 │                   │                                                                 │                   │
 │                   │ Proxy Recording Stream                                          │ 6. Recording File │
@@ -103,29 +103,27 @@ sequenceDiagram
     Agent->>SN: Click "Call via Vobiz" on User record
     SN->>Bridge: POST /start-call { to: "+1234...", agentId: "agent1" }
     Note over SN,Bridge: Authenticated via X-Vobiz-Secret
+    Bridge-->>SN: 202 Accepted (handed to the open softphone)
 
-    Bridge->>Vobiz: POST /api/v1/Account/{AuthID}/Call/ (with answer_url)
-    Vobiz-->>Bridge: 201 Created { request_uuid: "uuid-12345" }
-    Bridge-->>SN: 200 OK (Call Queued)
+    Softphone->>Bridge: GET /dial-requests (polled while signed in)
+    Bridge-->>Softphone: { dial: { to: "+1234..." } }
+
+    Softphone->>Vobiz: WSS INVITE sip:1234...@registrar.vobiz.ai (browser is the A leg)
+    Vobiz->>Bridge: POST /answer (From=sip:agent..., form-encoded)
+    Bridge-->>Vobiz: <Record/> + <Dial callerId="DID"><Number>1234...</Number></Dial>
 
     Vobiz->>Customer: PSTN Ring & Connect
     Customer-->>Vobiz: Answers Call
 
-    Vobiz->>Bridge: POST /answer?agentId=agent1
-    Bridge-->>Vobiz: 200 OK Vobiz XML: <Dial><User>sip:agent1@registrar.vobiz.ai</User></Dial>
-
-    Vobiz->>Softphone: WSS INVITE (Incoming Call)
-    Softphone-->>Vobiz: 200 OK (Auto-answer WebRTC SDP)
-    
     Note over Customer,Softphone: Two-way audio bridge established (Customer <-> Agent)
 
     opt Call Ended
         Customer->>Vobiz: Hangs Up
         Vobiz->>Softphone: BYE
-        Vobiz->>Bridge: POST /hangup-callback { CallUUID, Duration: 42 }
-        Vobiz->>Bridge: POST /recording-callback { CallUUID, RecordUrl: "https://media.vobiz.ai/..." }
-        Bridge->>SN: POST /api/now/table/interaction (Create CDR + Recording Link)
-        SN-->>Bridge: 201 Created (Interaction Record INC/INTxxxx)
+        Softphone->>Bridge: POST /sync-call { callUuid, duration }
+        Bridge->>SN: POST /api/now/table/interaction (create, once per call)
+        Vobiz->>Bridge: POST /recording-ready { CallUUID, RecordingID }
+        Bridge->>SN: PATCH /api/now/table/interaction/<sys_id> (signed recording link)
     end
 ```
 
@@ -144,7 +142,8 @@ sequenceDiagram
 
 ### 4.2. Backend Integration Bridge (`backend/`)
 - **Stateless Signaling & Session Cache**:
-  - Tracks active call UUIDs (`activeCalls` memory map) across the asynchronous lifecycle: `start-call` -> `answer` -> `recording-callback` -> `hangup-callback`.
+  - Tracks calls by CallUUID across the asynchronous lifecycle: `answer` -> `dial-status` -> `recording-ready`, and keeps one interaction record per call.
+  - Holds click-to-call numbers from `/start-call` until the agent's softphone collects them.
 - **Zero-Trust Security**:
   - Vobiz Auth ID and Auth Token never leave the backend `.env` boundary.
   - No secret tokens are stored in browser client scripts or ServiceNow form scripts.
