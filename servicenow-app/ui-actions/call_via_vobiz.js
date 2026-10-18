@@ -8,8 +8,9 @@
 // Show update: Checked (true)
 //
 // Description:
-// Initiates an outbound Vobiz phone call to the phone number on the current record.
-// Automatically connects to the logged-in agent's browser softphone.
+// Calls the phone number on the current record from the agent's Vobiz softphone.
+// The bridge hands the number to the agent's open, signed-in Vobiz panel, and
+// the panel places the call from the browser. The panel must be open and Ready.
 //
 // Properties used:
 // - vobiz.calling.tunnel_url: Base HTTPS URL of the Vobiz Calling Bridge
@@ -30,15 +31,17 @@
         return;
     }
     
-    // 2. Resolve target recipient phone number
-    var phone = "";
-    if (current.mobile_phone) {
-        phone = current.mobile_phone.toString().trim();
+    // 2. Resolve the number to call. On sys_user (and contacts) it is on the
+    //    record itself; on an incident it is the caller's; on a CSM case, the
+    //    contact's.
+    var phone = vobizPhoneFrom(current);
+    if (!phone && current.isValidField("caller_id") && !current.caller_id.nil()) {
+        phone = vobizPhoneFrom(current.caller_id.getRefRecord());
     }
-    if (!phone && current.phone) {
-        phone = current.phone.toString().trim();
+    if (!phone && current.isValidField("contact") && !current.contact.nil()) {
+        phone = vobizPhoneFrom(current.contact.getRefRecord());
     }
-    
+
     if (!phone) {
         gs.addErrorMessage("Vobiz Call failed: No mobile or phone number found on this record.");
         action.setRedirectURL(current);
@@ -67,11 +70,14 @@
         var responseBody = response.getBody();
         var httpStatus = response.getStatusCode();
         
-        // Support both 200 (Success) and 201 (Created/Queued)
-        if (httpStatus == 200 || httpStatus == 201) {
-            gs.addInfoMessage("Vobiz call initiated to " + phone + "! Connecting audio to your softphone...");
+        // 202: the number was handed to your open Vobiz panel, which places the
+        // call from the browser. 409: no signed-in panel is open to place it.
+        if (httpStatus == 202) {
+            gs.addInfoMessage("Calling " + phone + " from your Vobiz panel.");
         } else {
-            gs.addErrorMessage("Vobiz Call failed (Status " + httpStatus + "): " + responseBody);
+            var reason = responseBody;
+            try { reason = JSON.parse(responseBody).error || responseBody; } catch (e) {}
+            gs.addErrorMessage("Vobiz Call failed (Status " + httpStatus + "): " + reason);
         }
     } catch (ex) {
         gs.addErrorMessage("Vobiz Call Error: " + ex.getMessage());
@@ -80,3 +86,14 @@
     // Refresh the page
     action.setRedirectURL(current);
 })();
+
+function vobizPhoneFrom(gr) {
+    if (!gr) return "";
+    var fields = ["mobile_phone", "phone", "business_phone"];
+    for (var i = 0; i < fields.length; i++) {
+        if (gr.isValidField(fields[i]) && !gr.getElement(fields[i]).nil()) {
+            return gr.getValue(fields[i]).toString().trim();
+        }
+    }
+    return "";
+}

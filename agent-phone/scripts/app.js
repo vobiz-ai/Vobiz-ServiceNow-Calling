@@ -230,6 +230,7 @@ function setAuthMode(mode) {
   tab("mode-sip-tab", isSip);
 
   if (isSip) {
+    stopDialRequestPolling();
     const userField = document.getElementById("sip-username");
     const passField = document.getElementById("sip-password");
     const callerField = document.getElementById("sip-caller-id");
@@ -338,6 +339,7 @@ async function restoreVobizSession() {
       setDialEnabled(true);
       loadCallHistory();
       initVobizSip();
+      startDialRequestPolling();
     } else {
       setDialEnabled(false);
       initVobizSip();
@@ -376,6 +378,7 @@ async function vobizLogin() {
     setDialEnabled(true);
     loadCallHistory();
     initVobizSip();
+    startDialRequestPolling();
   } catch (err) {
     setLoginStatus(`Login failed: ${err.message}`);
     setDialEnabled(false);
@@ -917,6 +920,46 @@ async function placeCall(number) {
     setLoginStatus(message);
     setHangupVisible(false);
   }
+}
+
+// ─── Click-to-call from a ServiceNow record ──────────────────────────────────
+//
+// The Call via Vobiz button runs on the ServiceNow server, so it cannot reach
+// this panel directly. It leaves the number with the backend, and this panel
+// collects it and dials it like any other — the browser stays the A leg.
+
+let dialPollTimer = null;
+
+function startDialRequestPolling() {
+  if (dialPollTimer) return;
+  const poll = async () => {
+    if (!sessionToken || authMode === "sip") return;
+    try {
+      const res = await backendFetch("/dial-requests");
+      if (res.status === 401 || res.status === 403) {
+        stopDialRequestPolling();
+        return;
+      }
+      const data = await res.json().catch(() => ({}));
+      if (data && data.dial && data.dial.to) {
+        const input = document.getElementById("dialnumber");
+        if (input) input.value = data.dial.to;
+        openOpenFrameIfAvailable();
+        if (currentRTCSession) {
+          setLoginStatus(`Call via Vobiz: already on a call, so ${data.dial.to} was not dialled.`);
+        } else {
+          placeCall(data.dial.to);
+        }
+      }
+    } catch { /* the next poll will try again */ }
+  };
+  poll();
+  dialPollTimer = setInterval(poll, 2000);
+}
+
+function stopDialRequestPolling() {
+  if (dialPollTimer) clearInterval(dialPollTimer);
+  dialPollTimer = null;
 }
 
 function hangUp() {

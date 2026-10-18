@@ -7,49 +7,32 @@ const path = require("path");
 const BACKEND_PORT = 8094;
 const MOCK_VOBIZ_PORT = 9094;
 
-// Set up mock agents
-const AGENTS_FILE = path.join(__dirname, "agents.json");
-const originalAgents = fs.existsSync(AGENTS_FILE) ? fs.readFileSync(AGENTS_FILE, "utf8") : "{}";
+const SHARED_SECRET = "test_shared_secret";
 
-// Setup dummy .env
-const ENV_FILE = path.join(__dirname, ".env");
-let envExisted = false;
-let originalEnv = "";
-if (fs.existsSync(ENV_FILE)) {
-  envExisted = true;
-  originalEnv = fs.readFileSync(ENV_FILE, "utf8");
-}
-
-fs.writeFileSync(
-  ENV_FILE,
-  `
-VOBIZ_AUTH_ID=mock_auth_id
-VOBIZ_AUTH_TOKEN=mock_auth_token
-VOBIZ_FROM_NUMBER=+12003004000
-VOBIZ_SIP_USER=testuser_abc
-VOBIZ_SIP_PASSWORD=testpassword123
-PORT=${BACKEND_PORT}
-TUNNEL_URL=http://localhost:${BACKEND_PORT}
-VOBIZ_API_URL=http://localhost:${MOCK_VOBIZ_PORT}
-`,
-  "utf8"
-);
-
-// Write dummy test agent config
-fs.writeFileSync(
-  AGENTS_FILE,
-  JSON.stringify(
-    {
-      "test-agent": {
-        displayName: "Test Agent",
-        sipUser: "testuser_abc@registrar.vobiz.ai",
-      },
-    },
-    null,
-    2
-  ),
-  "utf8"
-);
+// The backend gets its configuration from the environment of the child process.
+// Nothing is written to backend/.env or agents.json, so a developer's real
+// configuration is never read, overwritten, or lost if the suite is killed.
+// Every setting is pinned, so values exported in your shell cannot leak in —
+// in particular, no ServiceNow instance is ever written to.
+const TEST_ENV = {
+  ENV_FILE: path.join(__dirname, "does-not-exist.test.env"),
+  VOBIZ_AUTH_ID: "mock_auth_id",
+  VOBIZ_AUTH_TOKEN: "mock_auth_token",
+  VOBIZ_FROM_NUMBER: "+12003004000",
+  VOBIZ_SIP_USER: "testuser_abc",
+  VOBIZ_SIP_PASSWORD: "testpassword123",
+  VOBIZ_REGISTRAR: "registrar.vobiz.ai",
+  VOBIZ_SHARED_SECRET: SHARED_SECRET,
+  PORT: String(BACKEND_PORT),
+  TUNNEL_URL: `http://localhost:${BACKEND_PORT}`,
+  VOBIZ_API_URL: `http://localhost:${MOCK_VOBIZ_PORT}`,
+  SERVICENOW_INSTANCE_URL: "",
+  SERVICENOW_USER: "",
+  SERVICENOW_PASSWORD: "",
+  SIGNING_SECRET: "test_signing_secret",
+  ALLOWED_ORIGINS: "",
+  DEFAULT_AGENT_ID: "admin",
+};
 
 console.log("[test] Mock environment configured.");
 
@@ -114,7 +97,7 @@ mockVobizServer.listen(MOCK_VOBIZ_PORT, () => {
   // Start backend server
   console.log("[test] Starting backend/server.js...");
   const serverProc = spawn("node", [path.join(__dirname, "server.js")], {
-    env: { ...process.env, PORT: BACKEND_PORT },
+    env: { PATH: process.env.PATH, ...TEST_ENV },
   });
 
   serverProc.stdout.on("data", (data) => {
@@ -268,27 +251,40 @@ mockVobizServer.listen(MOCK_VOBIZ_PORT, () => {
       assert.ok(phoneHtml.includes('id="mode-account-tab"'), "HTML should include login tabs");
       console.log("[test] ✓ Test 7 Passed: Softphone UI serving verified.");
 
-      // Test 8: ServiceNow Form Button click-to-dial (/start-call backward compatibility)
+      // Test 8: ServiceNow Form Button click-to-call (/start-call)
+      //
+      // The button must never originate a call from the backend: REST
+      // POST /Call/ + <Dial><User> leaves the customer listening to ringback.
+      // It hands the number to the agent's open softphone instead.
       console.log("[test] Test 8: Verifying ServiceNow UI Action trigger to /start-call...");
-      const startAnon = await fetch(`http://localhost:${BACKEND_PORT}/start-call`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ to: "+15550199", agentId: "test-agent" }),
-      });
-      assert.strictEqual(startAnon.status, 401, "/start-call originates a billed call and must be authenticated");
+      const startCall = (headers) =>
+        fetch(`http://localhost:${BACKEND_PORT}/start-call`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...headers },
+          body: JSON.stringify({ to: "+91 98765-43210", agentId: "test-agent" }),
+        });
+      assert.strictEqual((await startCall({})).status, 401, "/start-call must be authenticated");
+      assert.strictEqual((await startCall({ "X-Vobiz-Secret": "wrong" })).status, 401, "a wrong secret is refused");
 
-      const startRes = await fetch(`http://localhost:${BACKEND_PORT}/start-call`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${loginData.token}` },
-        body: JSON.stringify({
-          to: "+15550199",
-          agentId: "test-agent",
-        }),
+      const noPanel = await startCall({ "X-Vobiz-Secret": SHARED_SECRET });
+      assert.strictEqual(noPanel.status, 409, "with no softphone open there is nobody to place the call");
+
+      const poll = () =>
+        fetch(`http://localhost:${BACKEND_PORT}/dial-requests`, { headers: { Authorization: `Bearer ${loginData.token}` } }).then((r) => r.json());
+      assert.strictEqual((await poll()).dial, null, "an open panel with nothing queued gets nothing");
+
+      const startRes = await startCall({ "X-Vobiz-Secret": SHARED_SECRET });
+      assert.strictEqual(startRes.status, 202, "the number is handed to the open panel");
+      assert.strictEqual((await startRes.json()).to, "+919876543210");
+      assert.strictEqual((await poll()).dial.to, "+919876543210", "the panel collects the number to dial");
+      assert.strictEqual((await poll()).dial, null, "each number is dialled once");
+      assert.strictEqual(lastVobizCallRequest, null, "the backend must not originate the call over REST");
+
+      const sipPoll = await fetch(`http://localhost:${BACKEND_PORT}/dial-requests`, {
+        headers: { Authorization: `Bearer ${sipLoginData.token}` },
       });
-      assert.strictEqual(startRes.status, 201);
-      const startData = await startRes.json();
-      assert.strictEqual(startData.call_sid, "mock_call_sid_12345");
-      console.log("[test] ✓ Test 8 Passed: /start-call proxy succeeded.");
+      assert.strictEqual(sipPoll.status, 403, "a SIP-direct session does not receive click-to-call numbers");
+      console.log("[test] ✓ Test 8 Passed: Call via Vobiz hands the number to the softphone.");
 
       // ── Security properties ──
       //
@@ -423,15 +419,6 @@ mockVobizServer.listen(MOCK_VOBIZ_PORT, () => {
         serverProc.kill();
       } catch {}
 
-      // Restore files
-      fs.writeFileSync(AGENTS_FILE, originalAgents, "utf8");
-      if (envExisted) {
-        fs.writeFileSync(ENV_FILE, originalEnv, "utf8");
-      } else {
-        try {
-          fs.unlinkSync(ENV_FILE);
-        } catch {}
-      }
       setTimeout(() => process.exit(process.exitCode || 0), 200);
     }
   }

@@ -33,7 +33,9 @@ function loadDotEnv(envPath) {
     process.env[m[1]] = value;
   }
 }
-loadDotEnv(path.join(__dirname, ".env"));
+// ENV_FILE points elsewhere — the test suite uses it so it never reads, or
+// overwrites, your real backend/.env.
+loadDotEnv(process.env.ENV_FILE || path.join(__dirname, ".env"));
 
 const cleanEnvVar = (val) => (val ? val.trim().replace(/^["']|["']$/g, "") : "");
 
@@ -109,8 +111,16 @@ const fromBySipUser = new Map();
 // CallUUID -> CDR record
 const callsByUuid = new Map();
 const recentCalls = []; // newest first, capped at 200
-// Active calls tracking for /start-call backwards compatibility
-const activeCalls = new Map();
+// Click-to-call from a ServiceNow record. The record's UI Action runs on the
+// ServiceNow server and cannot reach the agent's browser, and the backend must
+// not dial the customer itself (see /start-call). So it leaves the number here,
+// and the agent's open softphone collects it and sends the INVITE.
+//   session token -> { agentId, lastPollAt }   panels currently open
+//   [{ id, to, token, createdAt }]             numbers waiting to be dialled
+const openPanels = new Map();
+const pendingDials = [];
+const PANEL_LIVE_MS = 15 * 1000;
+const DIAL_REQUEST_TTL_MS = 30 * 1000;
 
 const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
 
@@ -858,9 +868,29 @@ const server = http.createServer(async (req, res) => {
     return res.end(JSON.stringify({ loggedIn: false }));
   }
 
+  // The softphone polls this while it is open and signed in with the account.
+  // Each number is handed to exactly one panel, once.
+  if (pathname === "/dial-requests" && req.method === "GET") {
+    const s = requireAccountSession(req, res);
+    if (!s) return;
+    const token = (req.headers["authorization"] || "").slice(7);
+    openPanels.set(token, { agentId: s.agentId, lastPollAt: Date.now() });
+    const now = Date.now();
+    for (let i = pendingDials.length - 1; i >= 0; i--) {
+      if (now - pendingDials[i].createdAt > DIAL_REQUEST_TTL_MS) pendingDials.splice(i, 1);
+    }
+    const idx = pendingDials.findIndex((d) => d.token === token);
+    const dial = idx === -1 ? null : pendingDials.splice(idx, 1)[0];
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ dial: dial ? { id: dial.id, to: dial.to } : null }));
+  }
+
   if (pathname === "/logout" && req.method === "POST") {
     const header = req.headers["authorization"] || "";
-    if (header.startsWith("Bearer ")) sessions.delete(header.slice(7));
+    if (header.startsWith("Bearer ")) {
+      sessions.delete(header.slice(7));
+      openPanels.delete(header.slice(7));
+    }
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({ ok: true }));
   }
@@ -1163,15 +1193,14 @@ const server = http.createServer(async (req, res) => {
     );
   }
 
-  // ── Backwards compatibility: ServiceNow Form Button /start-call ──
+  // ── Click-to-call: the ServiceNow "Call via Vobiz" button ──
   if (pathname === "/start-call" && req.method === "POST") {
     try {
-      const publicBaseUrl = getPublicBaseUrl();
       const body = await readJsonBody(req);
-      // This route spends money: it originates a call on the account. A caller
-      // must present either the shared secret the ServiceNow UI Action sends,
-      // or a softphone session — never neither, including when the secret is
-      // simply not configured.
+      // This route spends money: it makes an agent's softphone place a billed
+      // call. A caller must present either the shared secret the ServiceNow UI
+      // Action sends, or an account session — never neither, including when
+      // the secret is simply not configured.
       const providedSecret = req.headers["x-vobiz-secret"] || req.headers["x-api-key"] || body.secret;
       const secretOk = Boolean(VOBIZ_SHARED_SECRET) && providedSecret === VOBIZ_SHARED_SECRET;
       if (!secretOk && !isAccountSession(req)) {
@@ -1191,29 +1220,41 @@ const server = http.createServer(async (req, res) => {
         return res.end(JSON.stringify({ error: "missing 'to' number" }));
       }
 
-      const agent = getAgent(reqAgentId || DEFAULT_AGENT_ID);
-      const answerUrl = `${publicBaseUrl || `http://localhost:${PORT}`}/answer?agentId=${encodeURIComponent(reqAgentId || DEFAULT_AGENT_ID)}`;
-      const params = new URLSearchParams({
-        to,
-        from: VOBIZ_FROM_NUMBER,
-        answer_url: answerUrl,
-        answer_method: "POST",
-        hangup_url: `${publicBaseUrl || `http://localhost:${PORT}`}/hangup-callback`,
-        hangup_method: "POST",
-      });
+      // The browser is the A leg, for this button too. Dialling the customer
+      // over the REST API and then bridging the agent in with <Dial><User> does
+      // not work on Vobiz: the customer answers, hears ringback, and is told the
+      // agent could not be reached. So this route originates nothing. It hands
+      // the number to the agent's open softphone, which sends the INVITE, and
+      // /answer replies <Dial><Number> exactly as for a call typed in the panel.
+      const destination = String(to).replace(/[^\d+]/g, "");
+      if (destination.replace(/\D/g, "").length < 6) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ error: `'${to}' is not a phone number` }));
+      }
 
-      const auth = Buffer.from(`${VOBIZ_AUTH_ID}:${VOBIZ_AUTH_TOKEN}`).toString("base64");
-      const vobizRes = await fetch(`${VOBIZ_API_URL}/api/v1/Account/${VOBIZ_AUTH_ID}/Call/`, {
-        method: "POST",
-        headers: {
-          Authorization: `Basic ${auth}`,
-          "Content-Type": "application/x-www-form-urlencoded",
-        },
-        body: params.toString(),
-      });
-      const vobizJson = await vobizRes.json();
-      res.writeHead(vobizRes.status, { "Content-Type": "application/json" });
-      return res.end(JSON.stringify(vobizJson));
+      const now = Date.now();
+      const live = [...openPanels.entries()].filter(
+        ([token, p]) => now - p.lastPollAt < PANEL_LIVE_MS && sessions.has(token)
+      );
+      const wantedAgent = reqAgentId || "";
+      const mine = live.filter(([, p]) => wantedAgent && p.agentId === wantedAgent);
+      const target = mine.length ? mine[0] : live.length === 1 ? live[0] : null;
+      if (!target) {
+        res.writeHead(409, { "Content-Type": "application/json" });
+        return res.end(
+          JSON.stringify({
+            error: live.length
+              ? `More than one Vobiz panel is open and none is signed in as ${wantedAgent || "this agent"}. Dial from your panel instead.`
+              : "No Vobiz panel is open and signed in. Open the Vobiz Calling panel, sign in, wait for Ready, and try again.",
+          })
+        );
+      }
+
+      const id = crypto.randomBytes(8).toString("hex");
+      pendingDials.push({ id, to: destination, token: target[0], createdAt: now });
+      console.log(`[backend] Click-to-call queued for the softphone: ${destination} (agent ${target[1].agentId})`);
+      res.writeHead(202, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ queued: true, id, to: destination }));
     } catch (err) {
       res.writeHead(500, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({ error: err.message }));
