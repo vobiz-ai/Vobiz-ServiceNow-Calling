@@ -55,6 +55,7 @@ console.log("[test] Mock environment configured.");
 
 // Create Mock Vobiz API Server
 let lastVobizCallRequest = null;
+const recordingLookups = [];
 const mockVobizServer = http.createServer((req, res) => {
   if (req.method === "GET" && req.url.includes("/numbers")) {
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -87,6 +88,7 @@ const mockVobizServer = http.createServer((req, res) => {
   }
 
   if (req.method === "GET" && req.url.includes("/Recording/")) {
+    recordingLookups.push(req.url);
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(
       JSON.stringify({
@@ -312,6 +314,18 @@ mockVobizServer.listen(MOCK_VOBIZ_PORT, () => {
       // whatever recording is most recent.
       const unsignedPlay = await fetch(`http://localhost:${BACKEND_PORT}/play-recording?callUuid=uuid_outbound_test_1`);
       assert.strictEqual(unsignedPlay.status, 403, "/play-recording must demand a signature or a session");
+
+      // A link signed for one call cannot be stretched to another recording by
+      // adding a recordingId the signature does not cover.
+      const signedForCall = new URL(callRecord.recordingUrl);
+      recordingLookups.length = 0;
+      await fetch(
+        `http://localhost:${BACKEND_PORT}/play-recording${signedForCall.search}&recordingId=someone_elses_recording`
+      );
+      assert.ok(
+        !recordingLookups.some((u) => u.includes("someone_elses_recording")),
+        "a playback signature must cover the id that is actually looked up"
+      );
 
       // An agent id in the path is not a credential: it proves nothing without
       // a token, and leaks neither the Auth ID nor the account's numbers.

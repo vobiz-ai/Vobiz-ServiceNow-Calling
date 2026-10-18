@@ -425,6 +425,10 @@ async function createServiceNowInteraction(callData) {
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+function escapeHtml(v) {
+  return String(v).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+}
+
 function toE164(raw) {
   const s = String(raw || "").trim();
   if (!s) return "";
@@ -1022,19 +1026,26 @@ const server = http.createServer(async (req, res) => {
     // caller from the softphone is the other accepted proof. A link that cannot
     // be resolved to its own call is refused — never answered with whatever
     // recording is most recent.
-    const signedFor = callUuid || recordingId;
-    if (!verifyRecordingSignature(signedFor, queryParams.exp, queryParams.sig) && !isAccountSession(req)) {
+    //
+    // The signature covers exactly one id, and only that id is looked up. A link
+    // signed for one call must not also carry a recordingId for another.
+    const accountSession = isAccountSession(req);
+    const recordingSigned = Boolean(recordingId) && verifyRecordingSignature(recordingId, queryParams.exp, queryParams.sig);
+    const callSigned = !recordingSigned && Boolean(callUuid) && verifyRecordingSignature(callUuid, queryParams.exp, queryParams.sig);
+    if (!accountSession && !recordingSigned && !callSigned) {
       res.writeHead(403, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({ error: "This playback link is invalid or has expired." }));
     }
+    const useRecordingId = accountSession || recordingSigned;
+    const useCallUuid = accountSession || callSigned;
 
     try {
       let targetAudioUrl = null;
-      if (recordingId) {
+      if (recordingId && useRecordingId) {
         const meta = await vobiz("GET", `/Recording/${encodeURIComponent(recordingId)}/`);
         targetAudioUrl = meta.body && (meta.body.recording_url || meta.body.url || meta.body.file);
       }
-      if (!targetAudioUrl && callUuid) {
+      if (!targetAudioUrl && callUuid && useCallUuid) {
         const recList = await vobiz("GET", `/Recording/?call_uuid=${encodeURIComponent(callUuid)}`);
         const items = (recList.body && (recList.body.objects || recList.body.items)) || [];
         if (items.length > 0) {
@@ -1049,7 +1060,7 @@ const server = http.createServer(async (req, res) => {
         return res.end(`<!DOCTYPE html><html><body style="font-family:sans-serif;text-align:center;padding:40px;">
           <h2>No Recording File Available</h2>
           <p>Recording is still processing or duration was 0s.</p>
-          <code>Call UUID: ${callUuid || "N/A"}</code>
+          <code>Call UUID: ${escapeHtml(callUuid || "N/A")}</code>
         </body></html>`);
       }
 
