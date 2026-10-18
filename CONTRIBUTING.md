@@ -30,7 +30,9 @@ For a security problem, do not open an issue — see [SECURITY.md](SECURITY.md).
 These are not style preferences.
 
 **Never commit a credential.** `backend/.env` is gitignored, and `agents.json`
-is committed — so it holds display names and SIP usernames only.
+is committed, so it holds display names only. No Vobiz account, number or SIP
+identity belongs in any tracked file: accounts arrive by signing in, and tests
+use fakes (`MA_TEST0001`, `+1200300400x`).
 
 **Never fetch a caller-supplied URL with credentials attached.** A new media
 endpoint takes an id, resolves the URL server-side, and checks it against

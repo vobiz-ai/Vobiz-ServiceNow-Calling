@@ -9,7 +9,8 @@
 //
 // Description:
 // Calls the phone number on the current record from the agent's Vobiz softphone.
-// The bridge hands the number to the agent's open, signed-in Vobiz panel, and
+// The bridge hands the number to the agent's open Vobiz panel (signed in on the
+// "Vobiz account" tab), and
 // the panel places the call from the browser. The panel must be open and Ready.
 //
 // Properties used:
@@ -19,8 +20,17 @@
 
 (function() {
     // 1. Retrieve tunnel URL and optional shared secret from ServiceNow System Properties
-    var tunnelUrl = gs.getProperty("vobiz.calling.tunnel_url", "https://<YOUR-TUNNEL-URL>").replace(/\/$/, "");
+    // Nothing about the bridge or the Vobiz account is written into this
+    // script: the bridge URL is a system property, and the Vobiz account is
+    // whichever one the agent signed in to the panel with.
+    var tunnelUrl = String(gs.getProperty("vobiz.calling.tunnel_url", "")).replace(/\/$/, "");
     var sharedSecret = gs.getProperty("vobiz.calling.shared_secret", "");
+
+    if (!/^https:\/\//.test(tunnelUrl)) {
+        gs.addErrorMessage("Vobiz Call failed: set the system property 'vobiz.calling.tunnel_url' to the bridge's public HTTPS URL.");
+        action.setRedirectURL(current);
+        return;
+    }
 
     // /start-call originates a billed call and is not open. Without this
     // property the bridge answers 401, so say why here rather than surfacing a

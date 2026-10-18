@@ -14,7 +14,7 @@
 const REGISTRAR_HOST = "registrar.vobiz.ai";
 
 let backendUrl = "";
-let agentId = "admin";
+let agentId = "";
 let registrarUrl = `wss://${REGISTRAR_HOST}:5063/`;
 
 let sessionToken = "";
@@ -68,8 +68,21 @@ async function init() {
     backendUrl = "http://localhost:8092";
   }
 
-  // Resolve Agent ID (defaults to ServiceNow username or 'admin')
-  agentId = urlParams.get("agentId") || urlParams.get("agent_id") || localStorage.getItem("vobiz.agentId") || "admin";
+  // Resolve Agent ID: the ServiceNow user name from the OpenFrame URL. Each
+  // agent id gets its own SIP endpoint on the account, so without one this
+  // browser makes up an id of its own rather than sharing a default with
+  // every other agent.
+  agentId = urlParams.get("agentId") || urlParams.get("agent_id") || "";
+  try {
+    if (agentId) localStorage.setItem("vobiz.agentId", agentId);
+    else agentId = localStorage.getItem("vobiz.agentId") || "";
+    if (!agentId) {
+      agentId = `agent-${Math.random().toString(36).slice(2, 10)}`;
+      localStorage.setItem("vobiz.agentId", agentId);
+    }
+  } catch {
+    agentId = agentId || `agent-${Math.random().toString(36).slice(2, 10)}`;
+  }
 
   console.log(`[Vobiz] Softphone initializing. Agent: ${agentId}, Backend: ${backendUrl}`);
 
@@ -87,6 +100,8 @@ async function init() {
   restoreAuthMode();
   if (authMode !== "sip") {
     await restoreVobizSession();
+  } else {
+    setStatus("Enter the endpoint password to connect", "pending");
   }
 }
 
@@ -270,23 +285,11 @@ function setAuthMode(mode) {
   tab("mode-account-tab", !isSip);
   tab("mode-sip-tab", isSip);
 
-  if (isSip) {
-    stopDialRequestPolling();
-    const userField = document.getElementById("sip-username");
-    const passField = document.getElementById("sip-password");
-    if (userField && !userField.value) {
-      backendFetch(`/agent/${encodeURIComponent(agentId)}`)
-        .then((r) => r.json())
-        .then((agent) => {
-          if (agent && agent.sipUser && !userField.value) {
-            const clean = agent.sipUser.split("@")[0].replace(/^sip:/, "");
-            userField.value = clean;
-            if (passField && !passField.value) passField.value = agent.sipPassword || "";
-          }
-        })
-        .catch(() => {});
-    }
-  }
+  // Features that need the account API are not available to an endpoint.
+  show("step-inbound", true);
+  show("setup-inbound-btn", !isSip);
+  show("inbound-sip-note", isSip);
+  if (isSip) stopDialRequestPolling();
 }
 
 function sipDirectCallerId() {
@@ -318,9 +321,10 @@ async function sipDirectConnect() {
   setLoginStatus(`Signing in as ${cleanUsername}…`);
 
   try {
-    // The backend answers with a session token scoped to SIP-direct mode. Call
-    // history, caller-ID selection and CRM write-back all sit behind a session
-    // now, so hold on to it.
+    // The backend records this SIP user -> caller ID for webhook routing and
+    // answers with a session token scoped to SIP-direct mode. Nothing is
+    // checked against an account here: Vobiz enforces that the caller ID is
+    // one of the account's numbers when the call is placed.
     const sipSession = await backendJson("/login-sip", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -332,11 +336,13 @@ async function sipDirectConnect() {
     }
   } catch (err) {
     console.warn("[Vobiz] Backend /login-sip note:", err.message);
-    setLoginStatus(`Backend rejected this caller ID: ${err.message}`);
+    setLoginStatus(`Could not sign in: ${err.message}`);
+    return;
   }
 
   setDialEnabled(true);
   startSipUA(sipUser, password, cleanUsername);
+  setLoginStatus(`Signed in as ${cleanUsername} — calling from ${callerId}`);
   loadCallHistory();
 }
 
@@ -362,20 +368,20 @@ async function restoreVobizSession() {
     const res = await backendFetch(`/session/${encodeURIComponent(agentId)}`);
     const session = await res.json().catch(() => ({}));
     if (session.loggedIn) {
-      try { await backendJson("/setup", { method: "POST" }); } catch (e) { console.warn("[Vobiz] setup note:", e); }
-      renderNumberOptions(session.numbers, session.from);
+      renderNumberOptions(session.numbers, session.from, session.numberDetails, session.appId);
       setLoginStatus(`Logged in as ${session.authId} — calling from ${session.from}`);
       setDialEnabled(true);
       loadCallHistory();
       initVobizSip();
       startDialRequestPolling();
     } else {
+      // Not signed in: there is no endpoint to register as until sign-in.
       setDialEnabled(false);
-      initVobizSip();
+      setStatus("Sign in to start", "pending");
     }
   } catch (err) {
     console.warn("[Vobiz] Could not restore session:", err);
-    initVobizSip();
+    setStatus("Cannot reach the calling backend bridge.", "error");
   }
 }
 
@@ -400,10 +406,13 @@ async function vobizLogin() {
 
     sessionToken = data.token;
     sessionStorage.setItem("vobiz_session_token", sessionToken);
+    // The token never stays in the page once it has been used.
+    if (authTokenInput) authTokenInput.value = "";
 
-    try { await backendJson("/setup", { method: "POST" }); } catch (e) { console.warn("[Vobiz] setup note:", e); }
-    renderNumberOptions(data.numbers, data.selected);
-    setLoginStatus(`Logged in as ${authId} — calling from ${data.selected}`);
+    renderNumberOptions(data.numbers, data.selected, data.numberDetails, data.appId);
+    setLoginStatus(data.selected
+      ? `Logged in as ${authId} — calling from ${data.selected}`
+      : `Logged in as ${authId} — this account has no numbers to call from yet`);
     setDialEnabled(true);
     loadCallHistory();
     initVobizSip();
@@ -423,6 +432,7 @@ async function vobizSelectNumber(e) {
       body: JSON.stringify({ number }),
     });
     setLoginStatus(`Caller ID set to ${number}`);
+    describeInbound(number);
   } catch (err) {
     setLoginStatus(`Could not set caller ID: ${err.message}`);
   }
@@ -515,7 +525,26 @@ function setHangupVisible(visible) {
   }
 }
 
-function renderNumberOptions(numbers, selected) {
+// The account's active, voice-enabled numbers, as listed by Vobiz at sign-in,
+// with the application each is attached to now.
+let numberDetails = [];
+let integrationAppId = "";
+
+function describeInbound(number) {
+  const hint = document.getElementById("inbound-setup-status");
+  if (!hint || authMode === "sip") return;
+  const d = numberDetails.find((n) => n.e164 === number);
+  if (!d) { hint.textContent = ""; return; }
+  hint.textContent = !d.applicationId
+    ? `${number} is not attached to any application yet.`
+    : d.applicationId === integrationAppId
+      ? `${number} already rings this panel.`
+      : `Enabling moves ${number} off application ${d.applicationId}.`;
+}
+
+function renderNumberOptions(numbers, selected, details, appId) {
+  numberDetails = Array.isArray(details) ? details : [];
+  integrationAppId = appId ? String(appId) : "";
   const select = document.getElementById("vobiz-number-select");
   const label = document.getElementById("vobiz-number-label");
   if (!select) return;
@@ -531,13 +560,17 @@ function renderNumberOptions(numbers, selected) {
   numbers.forEach(num => {
     const opt = document.createElement("option");
     opt.value = num;
-    opt.textContent = num;
+    const d = numberDetails.find((n) => n.e164 === num);
+    opt.textContent = d && d.applicationId
+      ? `${num} · ${d.applicationId === integrationAppId ? "rings here" : `app ${d.applicationId}`}`
+      : num;
     if (num === selected) opt.selected = true;
     select.appendChild(opt);
   });
   select.disabled = false;
   select.hidden = false;
   if (label) label.hidden = false;
+  describeInbound(select.value);
 }
 
 // ─── Call History & Recordings ───────────────────────────────────────────────
@@ -546,6 +579,10 @@ async function loadCallHistory() {
   const historyList = document.getElementById("call-history-list");
   if (!historyList) return;
 
+  if (authMode === "sip") {
+    historyList.innerHTML = `<li class="history-empty">Sign in with your Vobiz account to use this.</li>`;
+    return;
+  }
   historyList.innerHTML = `<li class="history-empty">Loading recent recordings…</li>`;
   try {
     const data = await backendJson("/recordings?limit=10");
@@ -593,16 +630,30 @@ async function loadCallHistory() {
 // ─── Inbound Webhook Setup ───────────────────────────────────────────────────
 
 async function setupInboundCalling() {
+  if (authMode === "sip") {
+    setLoginStatus("Sign in with your Vobiz account to use this.");
+    return;
+  }
   const statusEl = document.getElementById("inbound-setup-status");
   if (statusEl) {
     statusEl.textContent = "Configuring inbound routing…";
     statusEl.hidden = false;
   }
   try {
-    const data = await backendJson("/setup-inbound", { method: "POST" });
+    const select = document.getElementById("vobiz-number-select");
+    const number = select ? select.value : "";
+    const data = await backendJson("/setup-inbound", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ number }),
+    });
     if (statusEl) {
       statusEl.textContent = data.message || "Inbound configuration updated successfully.";
     }
+    const d = numberDetails.find((n) => n.e164 === data.number);
+    if (d) d.applicationId = String(data.appId || "");
+    renderNumberOptions(numberDetails.map((n) => n.e164), data.number, numberDetails, data.appId);
+    if (statusEl) statusEl.textContent = data.message || "";
   } catch (err) {
     if (statusEl) {
       statusEl.textContent = `Inbound setup note: ${err.message}`;
@@ -724,18 +775,15 @@ async function initVobizSip() {
 
   let agent;
   try {
-    const res = await backendFetch(`/agent/${encodeURIComponent(agentId)}`);
+    // This session's own endpoint, provisioned at sign-in, with the password
+    // set at that sign-in. It is held in memory only.
+    const res = await backendFetch("/agent");
     if (!res.ok) {
-      const resSession = await backendFetch("/agent");
-      if (resSession.ok) agent = await resSession.json();
-      else {
-        setStatus(`Could not load identity for "${agentId}".`, "error");
-        setSipRegistered(false);
-        return;
-      }
-    } else {
-      agent = await res.json();
+      setStatus("Sign in to start", "pending");
+      setSipRegistered(false);
+      return;
     }
+    agent = await res.json();
   } catch (err) {
     console.error("[Vobiz] Cannot reach calling bridge backend:", err);
     setStatus("Cannot reach the calling backend bridge.", "error");
@@ -850,13 +898,18 @@ function startSipUA(sipUser, sipPassword, displayName) {
   }
 }
 
+// The caller ID rides on the INVITE as X-VH-Caller-ID; the backend checks it
+// (one of the account's numbers in account mode, strict E.164 in SIP direct).
 function callHeaders() {
-  const headers = [];
+  let callerId = "";
   if (authMode === "sip") {
-    const callerId = sipDirectCallerId().replace(/[^\d+]/g, "");
-    if (callerId) headers.push(`X-VH-Caller-ID: ${callerId}`);
+    callerId = sipDirectCallerId();
+  } else {
+    const select = document.getElementById("vobiz-number-select");
+    callerId = select ? select.value : "";
   }
-  return headers;
+  callerId = String(callerId || "").replace(/[^\d+]/g, "");
+  return /^\+[1-9]\d{7,14}$/.test(callerId) ? [`X-VH-Caller-ID: ${callerId}`] : [];
 }
 
 // ─── Outbound Calling ────────────────────────────────────────────────────────
