@@ -387,7 +387,7 @@ async function createServiceNowInteraction(callData) {
     console.log("[backend] ServiceNow credentials not configured. Skipping interaction creation.");
     return null;
   }
-  const { to, agentId, durationSeconds, recordingUrl, from, callDirection = "Outbound", notes = "" } = callData;
+  const { to, agentId, durationSeconds, recordingUrl, from, callDirection = "Outbound", notes = "", existingSysId } = callData;
   const cleanUrl = SERVICENOW_INSTANCE_URL.replace(/\/$/, "");
   const userSysId = await getServiceNowUserSysId(agentId);
   const auth = Buffer.from(`${SERVICENOW_USER}:${SERVICENOW_PASSWORD}`).toString("base64");
@@ -415,23 +415,59 @@ async function createServiceNowInteraction(callData) {
     payload.work_notes += `\nAgent: ${agentId}`;
   }
 
+  // The same call is reported twice — by the softphone when it hangs up, and by
+  // Vobiz when the recording is ready. The second report updates the record the
+  // first one created (work_notes is a journal field, so this appends).
+  const url = existingSysId
+    ? `${cleanUrl}/api/now/table/interaction/${encodeURIComponent(existingSysId)}`
+    : `${cleanUrl}/api/now/table/interaction`;
+  const body = existingSysId
+    ? { recording_url: payload.recording_url, work_notes: payload.work_notes }
+    : payload;
+  if (existingSysId && !body.recording_url) delete body.recording_url;
+
   try {
-    const res = await fetch(`${cleanUrl}/api/now/table/interaction`, {
-      method: "POST",
+    const res = await fetch(url, {
+      method: existingSysId ? "PATCH" : "POST",
       headers: {
         Authorization: `Basic ${auth}`,
         "Content-Type": "application/json",
         Accept: "application/json",
       },
-      body: JSON.stringify(payload),
+      body: JSON.stringify(body),
     });
-    const json = await res.json();
-    console.log("[backend] ServiceNow Interaction created successfully:", res.status, json.result ? json.result.number : json);
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      console.error(`[backend] ServiceNow refused the interaction (HTTP ${res.status}):`, JSON.stringify(json).slice(0, 300));
+      return null;
+    }
+    console.log(
+      `[backend] ServiceNow interaction ${existingSysId ? "updated" : "created"}:`,
+      json.result ? json.result.number : res.status
+    );
     return json;
   } catch (err) {
     console.error("[backend] Error creating interaction in ServiceNow:", err.message);
     return null;
   }
+}
+
+// One interaction per call: callUuid -> Promise of that call's interaction
+// sys_id. Writes for the same call are chained, so the second one updates the
+// record the first created even when both arrive together.
+const interactionByCall = new Map();
+
+function logCallToServiceNow(callUuid, callData) {
+  if (!callUuid) return createServiceNowInteraction(callData);
+  const previous = interactionByCall.get(callUuid) || Promise.resolve(null);
+  let result = null;
+  const sysId = previous.then(async (existingSysId) => {
+    result = await createServiceNowInteraction({ ...callData, existingSysId });
+    return existingSysId || (result && result.result && result.result.sys_id) || null;
+  });
+  interactionByCall.set(callUuid, sysId);
+  if (interactionByCall.size > 500) interactionByCall.delete(interactionByCall.keys().next().value);
+  return sysId.then(() => result);
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -605,7 +641,7 @@ async function handleRecordingReady(req, res, params) {
 
     // Auto-create ServiceNow interaction if configured
     const playLink = signCallPlaybackUrl(callUuid);
-    await createServiceNowInteraction({
+    await logCallToServiceNow(callUuid, {
       to: rec.to,
       from: rec.from,
       agentId: rec.agentSipUser || DEFAULT_AGENT_ID,
@@ -1162,7 +1198,7 @@ const server = http.createServer(async (req, res) => {
       }
       const recordingUrl = callUuid ? signCallPlaybackUrl(callUuid) : "";
 
-      const result = await createServiceNowInteraction({
+      const result = await logCallToServiceNow(rec ? callUuid : null, {
         to: toNumber || (rec && rec.to),
         from: (rec && rec.from) || VOBIZ_FROM_NUMBER,
         durationSeconds: duration || (rec && rec.duration) || 0,

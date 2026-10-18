@@ -26,9 +26,10 @@ const TEST_ENV = {
   PORT: String(BACKEND_PORT),
   TUNNEL_URL: `http://localhost:${BACKEND_PORT}`,
   VOBIZ_API_URL: `http://localhost:${MOCK_VOBIZ_PORT}`,
-  SERVICENOW_INSTANCE_URL: "",
-  SERVICENOW_USER: "",
-  SERVICENOW_PASSWORD: "",
+  // ServiceNow is the mock below, never a real instance.
+  SERVICENOW_INSTANCE_URL: `http://localhost:${MOCK_VOBIZ_PORT}`,
+  SERVICENOW_USER: "mock_sn_user",
+  SERVICENOW_PASSWORD: "mock_sn_password",
   SIGNING_SECRET: "test_signing_secret",
   ALLOWED_ORIGINS: "",
   DEFAULT_AGENT_ID: "admin",
@@ -39,7 +40,24 @@ console.log("[test] Mock environment configured.");
 // Create Mock Vobiz API Server
 let lastVobizCallRequest = null;
 const recordingLookups = [];
+const serviceNowWrites = [];
 const mockVobizServer = http.createServer((req, res) => {
+  // Mock ServiceNow Table API, on the same port.
+  if (req.url.startsWith("/api/now/table/sys_user")) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ result: [] }));
+  }
+  if (req.url.startsWith("/api/now/table/interaction")) {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      serviceNowWrites.push({ method: req.method, url: req.url, body: JSON.parse(body || "{}") });
+      res.writeHead(req.method === "POST" ? 201 : 200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ result: { sys_id: "sn_sys_1", number: "IMS0001001" } }));
+    });
+    return;
+  }
+
   if (req.method === "GET" && req.url.includes("/numbers")) {
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(
@@ -217,6 +235,30 @@ mockVobizServer.listen(MOCK_VOBIZ_PORT, () => {
       assert.strictEqual(callRecord.callUuid, "uuid_outbound_test_1");
       assert.strictEqual(callRecord.duration, 42);
       console.log("[test] ✓ Test 5 Passed: CDR dial status and query verified.");
+
+      // Test 5b: one interaction per call. The softphone reports the call when
+      // it hangs up and Vobiz reports it again when the recording is ready, and
+      // Vobiz posts that webhook form-encoded.
+      const syncRes = await fetch(`http://localhost:${BACKEND_PORT}/sync-call`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${loginData.token}` },
+        body: JSON.stringify({ callUuid: "uuid_outbound_test_1", toNumber: "+15550199", duration: 42 }),
+      });
+      assert.strictEqual(syncRes.status, 200);
+      await fetch(`http://localhost:${BACKEND_PORT}/recording-ready`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ CallUUID: "uuid_outbound_test_1", RecordingID: "rec_123", RecordingDuration: "40" }).toString(),
+      });
+      const creates = serviceNowWrites.filter((w) => w.method === "POST");
+      const updates = serviceNowWrites.filter((w) => w.method === "PATCH");
+      assert.strictEqual(creates.length, 1, "one interaction record per call");
+      assert.strictEqual(updates.length, 1, "the recording webhook updates that record");
+      assert.ok(updates[0].url.endsWith("/interaction/sn_sys_1"));
+      const written = JSON.stringify(serviceNowWrites);
+      assert.ok(!written.includes("mock_auth_token") && !written.includes("mock_auth_id"), "no account credential is written into ServiceNow");
+      assert.ok(/play-recording\?callUuid=uuid_outbound_test_1&exp=\d+&sig=[0-9a-f]{64}/.test(written), "the work note carries a signed link");
+      console.log("[test] ✓ Test 5b Passed: one interaction per call, no credentials in it.");
 
       // Test 6: Softphone agent info lookup
       console.log("[test] Test 6: Verifying softphone /agent/:agentId endpoint...");
