@@ -54,7 +54,11 @@ const SERVICENOW_USER = cleanEnvVar(process.env.SERVICENOW_USER);
 const SERVICENOW_PASSWORD = cleanEnvVar(process.env.SERVICENOW_PASSWORD);
 
 const SIGNING_SECRET = cleanEnvVar(process.env.SIGNING_SECRET) || crypto.randomBytes(32).toString("hex");
+// Two lifetimes. A link the panel plays straight away is short-lived; a link
+// written into a ServiceNow record is opened days later from the work notes,
+// so it gets its own, longer lifetime (default 7 days).
 const RECORDING_URL_TTL_SECONDS = Number(cleanEnvVar(process.env.RECORDING_URL_TTL_SECONDS) || 300);
+const RECORD_LINK_TTL_SECONDS = Number(cleanEnvVar(process.env.RECORD_LINK_TTL_SECONDS) || 7 * 24 * 60 * 60);
 
 // Where the endpoint map lives: { "<authId>:<agentId>": { endpointId, username } }.
 // Ids only — never a password or a token.
@@ -113,8 +117,13 @@ const recentCalls = []; // newest first, capped at 200
 // and the agent's open softphone collects it and sends the INVITE.
 //   session token -> { agentId, lastPollAt }   panels currently open
 //   [{ id, to, token, createdAt }]             numbers waiting to be dialled
+//   SIP username -> { to, source, at }         the record a collected number
+//                                              came from, until /answer sees it
 const openPanels = new Map();
 const pendingDials = [];
+const clickContexts = new Map();
+const CLICK_CONTEXT_TTL_MS = 2 * 60 * 1000;
+const lastDigits = (n) => String(n || "").replace(/\D/g, "").slice(-10);
 const PANEL_LIVE_MS = 15 * 1000;
 const DIAL_REQUEST_TTL_MS = 30 * 1000;
 
@@ -461,9 +470,11 @@ function signRecordingUrl(authId, recordingId) {
   return `${publicBase || ""}/recording-audio/${encodeURIComponent(recordingId)}?acct=${encodeURIComponent(authId)}&exp=${exp}&sig=${sig}`;
 }
 
-function signCallPlaybackUrl(authId, callUuid) {
+// ttlSeconds: RECORDING_URL_TTL_SECONDS for panel playback (the default),
+// RECORD_LINK_TTL_SECONDS for a link written into a ServiceNow record.
+function signCallPlaybackUrl(authId, callUuid, ttlSeconds = RECORDING_URL_TTL_SECONDS) {
   const publicBase = getPublicBaseUrl() || `http://localhost:${PORT}`;
-  const exp = Math.floor(Date.now() / 1000) + RECORDING_URL_TTL_SECONDS;
+  const exp = Math.floor(Date.now() / 1000) + ttlSeconds;
   const sig = hmacFor(authId, callUuid, exp);
   return `${publicBase}/play-recording?callUuid=${encodeURIComponent(callUuid)}&acct=${encodeURIComponent(authId)}&exp=${exp}&sig=${sig}`;
 }
@@ -605,7 +616,7 @@ async function createServiceNowInteraction(callData) {
     console.log("[backend] ServiceNow credentials not configured. Skipping interaction creation.");
     return null;
   }
-  const { to, agentId, durationSeconds, recordingUrl, from, callDirection = "Outbound", notes = "", existingSysId } = callData;
+  const { to, agentId, durationSeconds, recordingUrl, from, callDirection = "Outbound", notes = "", existingSysId, missed, source } = callData;
   const cleanUrl = SERVICENOW_INSTANCE_URL.replace(/\/$/, "");
   const userSysId = await getServiceNowUserSysId(agentId);
   const auth = Buffer.from(`${SERVICENOW_USER}:${SERVICENOW_PASSWORD}`).toString("base64");
@@ -622,9 +633,13 @@ async function createServiceNowInteraction(callData) {
     state: "closed_complete",
     opened_at: formatServiceNowDate(opened),
     closed_at: formatServiceNowDate(now),
-    short_description: `Vobiz ${callDirection} Call: ${to}`,
+    short_description: missed ? `Vobiz Missed ${callDirection} Call: ${from}` : `Vobiz ${callDirection} Call: ${to}`,
     recording_url: recordingUrl || "",
-    work_notes: `Vobiz Call Details:\nDirection: ${callDirection}\nFrom: ${from}\nTo: ${to}\nDuration: ${durationSeconds || 0} seconds\nRecording: ${recordLink}${notes ? `\nNotes: ${notes}` : ""}`,
+    work_notes:
+      `Vobiz Call Details:\nDirection: ${callDirection}${missed ? " (missed)" : ""}\nFrom: ${from}\nTo: ${to}\n` +
+      `Duration: ${durationSeconds || 0} seconds\nRecording: ${recordLink}` +
+      (source ? `\nStarted from: ${source.table} ${source.sysId}` : "") +
+      (notes ? `\nNotes: ${notes}` : ""),
   };
 
   if (userSysId) {
@@ -670,6 +685,38 @@ async function createServiceNowInteraction(callData) {
   }
 }
 
+// A call placed with "Call via Vobiz" is tied back to the record it was started
+// from. The interaction's own reference fields vary by instance and plugin, so
+// the link is a work note on the source record (and a "Started from" line on
+// the interaction). On a table without work notes, such as sys_user, the
+// Table API ignores the field and nothing is written.
+const SOURCE_TABLE_RE = /^[a-z][a-z0-9_]{0,79}$/;
+const SOURCE_SYS_ID_RE = /^[0-9a-f]{32}$/;
+
+function cleanSource(table, sysId) {
+  const t = String(table || "").trim();
+  const id = String(sysId || "").trim().toLowerCase();
+  return SOURCE_TABLE_RE.test(t) && SOURCE_SYS_ID_RE.test(id) ? { table: t, sysId: id } : null;
+}
+
+async function noteOnSourceRecord(source, interaction, callData) {
+  const cleanUrl = SERVICENOW_INSTANCE_URL.replace(/\/$/, "");
+  const auth = Buffer.from(`${SERVICENOW_USER}:${SERVICENOW_PASSWORD}`).toString("base64");
+  const label = interaction.number || interaction.sys_id;
+  try {
+    const res = await fetch(`${cleanUrl}/api/now/table/${encodeURIComponent(source.table)}/${encodeURIComponent(source.sysId)}`, {
+      method: "PATCH",
+      headers: { Authorization: `Basic ${auth}`, "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({
+        work_notes: `Vobiz ${callData.callDirection || "Outbound"} call to ${callData.to} logged as interaction ${label}.`,
+      }),
+    });
+    if (!res.ok) console.warn(`[backend] Could not note the call on ${source.table} (HTTP ${res.status})`);
+  } catch (err) {
+    console.warn("[backend] Could not note the call on its source record:", err.message);
+  }
+}
+
 // One interaction per call: callUuid -> Promise of that call's interaction
 // sys_id. Writes for the same call are chained, so the second one updates the
 // record the first created even when both arrive together.
@@ -681,6 +728,8 @@ function logCallToServiceNow(callUuid, callData) {
   let result = null;
   const sysId = previous.then(async (existingSysId) => {
     result = await createServiceNowInteraction({ ...callData, existingSysId });
+    const created = !existingSysId && result && result.result && result.result.sys_id;
+    if (created && callData.source) await noteOnSourceRecord(callData.source, result.result, callData);
     return existingSysId || (result && result.result && result.result.sys_id) || null;
   });
   interactionByCall.set(callUuid, sysId);
@@ -779,6 +828,7 @@ function handleAnswer(req, res, queryParams, bodyParams) {
 
   const publicBase = getPublicBaseUrl() || `http://localhost:${PORT}`;
   const dialStatusUrl = `${publicBase}/dial-status`;
+  const dialEventsUrl = `${publicBase}/dial-events`;
   const recordCallbackUrl = `${publicBase}/recording-ready`;
 
   // <Record> as a self-closing sibling BEFORE <Dial>
@@ -808,6 +858,15 @@ function handleAnswer(req, res, queryParams, bodyParams) {
     }
     const destination = to.replace(/^sip:/, "").split("@")[0].replace(/[^\d+]/g, "");
 
+    // A call this panel collected from "Call via Vobiz" carries the record it
+    // was started from, so its interaction can be tied back to it.
+    const ctx = clickContexts.get(sipUser);
+    let source = null;
+    if (ctx && Date.now() - ctx.at < CLICK_CONTEXT_TTL_MS && lastDigits(ctx.to) === lastDigits(destination)) {
+      source = ctx.source;
+      clickContexts.delete(sipUser);
+    }
+
     rememberCall({
       callUuid,
       authId: who.authId,
@@ -816,6 +875,7 @@ function handleAnswer(req, res, queryParams, bodyParams) {
       agentSipUser: sipUser,
       from: callerId,
       to: destination,
+      source,
       startedAt: Date.now(),
     });
 
@@ -846,22 +906,33 @@ function handleAnswer(req, res, queryParams, bodyParams) {
     return res.end(politeHangup("Sorry, no one is available to take your call right now. Please try again later."));
   }
 
+  // The customer's number. <Dial callerId> has to be one of the account's own
+  // numbers, so the panel would otherwise see the DID; the real caller rides
+  // in callerName, which the panel prefers for display, lookup and logging.
+  const caller = strictE164(toE164(from)) || from.replace(/[^\d+]/g, "").slice(0, 16);
+
+  // Nobody owns the call until a panel answers it: /dial-events records who
+  // did, and only that agent's panel may log it. A call nobody answers is
+  // logged once, as missed, by the backend (see handleDialStatus).
   rememberCall({
     callUuid,
     authId: owner ? owner[0] : null,
-    agentId: (sipUsers.get(targets[0]) || {}).agentId,
+    agentId: null,
     direction: "Inbound",
-    agentSipUser: targets[0],
-    from,
+    agentSipUser: null,
+    ringing: targets,
+    answeredBy: null,
+    from: caller || from,
     to: dialled,
     startedAt: Date.now(),
   });
 
   console.log(`[backend] -> Inbound call from ${from} to ${dialled}, ringing ${targets.length} agent(s)`);
   const users = targets.map((u) => `    <User>sip:${escapeHtml(u)}@${VOBIZ_REGISTRAR}</User>`).join("\n");
+  const callerNameAttr = caller ? ` callerName="${escapeHtml(caller)}"` : "";
   const xml =
     `${XML_HEAD}<Response>\n  ${recordXml}\n` +
-    `  <Dial callerId="${escapeHtml(dialled)}" timeout="30" timeLimit="14400" action="${dialStatusUrl}" method="POST" redirect="false">\n` +
+    `  <Dial callerId="${escapeHtml(dialled)}"${callerNameAttr} timeout="30" timeLimit="14400" action="${dialStatusUrl}" method="POST" redirect="false" callbackUrl="${dialEventsUrl}" callbackMethod="POST">\n` +
     `${users}\n  </Dial>\n</Response>`;
   return res.end(xml);
 }
@@ -881,8 +952,64 @@ function handleDialStatus(req, res, params) {
     rec.bLegUuid = bleg || null;
     rec.duration = Number(d.DialBLegDuration || 0);
     rec.endedAt = Date.now();
+    const status = String(d.DialStatus || "").toLowerCase();
+    if (rec.direction === "Inbound" && !rec.answeredBy && (status === "completed" || status === "answered")) {
+      markAnswered(rec, d.DialBLegTo);
+    }
+    // Answered, but Vobiz never said by whom: no panel may log it, and it is
+    // not missed either. The recording webhook logs it, unassigned.
+    if (rec.direction === "Inbound" && !rec.answeredBy && (status === "completed" || status === "answered")) {
+      rec.answeredUnknown = true;
+    }
+    // Inbound and nobody answered: logged here, once, with 0 s — never by
+    // the panels that rang.
+    if (rec.direction === "Inbound" && !rec.answeredBy && !rec.answeredUnknown && !rec.missedLogged) {
+      rec.missedLogged = true;
+      rec.duration = 0;
+      logCallToServiceNow(callUuid, {
+        to: rec.to,
+        from: rec.from,
+        agentId: null,
+        durationSeconds: 0,
+        recordingUrl: "",
+        callDirection: "Inbound",
+        missed: true,
+        notes: `Missed: no agent answered (${d.DialStatus || "no answer"}).`,
+      }).catch(() => {});
+    }
   }
 
+  res.writeHead(200, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ status: "ok" }));
+}
+
+// The SIP username in a B-leg address: "sip:user@host", "user@host" or "user".
+function sipUserFromLeg(raw) {
+  return String(raw || "").replace(/^sips?:/i, "").split(/[@;]/)[0].trim();
+}
+
+// The first panel to answer owns an inbound call. Only an agent that was rung
+// for it can be named, and the owner never changes once set.
+function markAnswered(rec, bLegTo) {
+  const user = sipUserFromLeg(bLegTo);
+  if (rec.answeredBy || !user || !(rec.ringing || []).includes(user)) return false;
+  const who = sipUsers.get(user) || {};
+  rec.answeredBy = user;
+  rec.agentSipUser = user;
+  rec.agentId = who.agentId || user;
+  console.log(`[backend] Inbound call ${rec.callUuid} answered by ${rec.agentId}`);
+  return true;
+}
+
+// Real-time <Dial> events (callbackUrl). DialAnswer names the B leg that
+// picked up, which is how the backend knows which panel answered.
+function handleDialEvents(req, res, params) {
+  const event = String(params.Event || params.event || "");
+  const callUuid = String(params.CallUUID || params.call_uuid || params.DialALegUUID || "");
+  const rec = callsByUuid.get(callUuid);
+  if (rec && rec.direction === "Inbound" && (event === "DialAnswer" || event === "DialConnected")) {
+    markAnswered(rec, params.DialBLegTo);
+  }
   res.writeHead(200, { "Content-Type": "application/json" });
   res.end(JSON.stringify({ status: "ok" }));
 }
@@ -904,14 +1031,19 @@ async function handleRecordingReady(req, res, params) {
 
     // Auto-create ServiceNow interaction if configured
     // A SIP-direct call has no account credentials here to fetch audio with.
-    const playLink = rec.authId ? signCallPlaybackUrl(rec.authId, callUuid) : "";
+    // This link goes into the record, so it gets the long lifetime.
+    const playLink = rec.authId ? signCallPlaybackUrl(rec.authId, callUuid, RECORD_LINK_TTL_SECONDS) : "";
+    const missed = rec.direction === "Inbound" && !rec.answeredBy && !rec.answeredUnknown;
+    if (missed) rec.missedLogged = true;
     await logCallToServiceNow(callUuid, {
       to: rec.to,
       from: rec.from,
-      agentId: rec.agentId || rec.agentSipUser,
-      durationSeconds: rec.duration || duration,
+      agentId: missed ? null : rec.agentId || rec.agentSipUser,
+      durationSeconds: missed ? 0 : rec.duration || duration,
       recordingUrl: playLink,
       callDirection: rec.direction || "Outbound",
+      missed,
+      source: rec.source,
     });
   }
 
@@ -984,6 +1116,16 @@ const server = http.createServer(async (req, res) => {
       } catch {}
     }
     return handleAnswer(req, res, queryParams, body);
+  }
+
+  if (pathname === "/dial-events") {
+    let body = {};
+    if (req.method === "POST") {
+      try {
+        body = await readJsonBody(req);
+      } catch {}
+    }
+    return handleDialEvents(req, res, { ...queryParams, ...body });
   }
 
   if (pathname === "/dial-status") {
@@ -1124,11 +1266,14 @@ const server = http.createServer(async (req, res) => {
           numberDetails: s.numberDetails || [],
           appId: s.authId && accounts.get(s.authId) ? accounts.get(s.authId).appId : null,
           from: s.from,
+          registrar: VOBIZ_REGISTRAR,
         })
       );
     }
+    // The registrar is deployment configuration, not account data: the panel
+    // needs it before sign-in to register a SIP-direct endpoint.
     res.writeHead(200, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({ loggedIn: false }));
+    return res.end(JSON.stringify({ loggedIn: false, registrar: VOBIZ_REGISTRAR }));
   }
 
   // The softphone polls this while it is open and signed in.
@@ -1137,13 +1282,16 @@ const server = http.createServer(async (req, res) => {
     const s = requireAccountSession(req, res);
     if (!s) return;
     const token = (req.headers["authorization"] || "").slice(7);
-    openPanels.set(token, { agentId: s.agentId, lastPollAt: Date.now() });
+    openPanels.set(token, { agentId: s.agentId, authId: s.authId, lastPollAt: Date.now() });
     const now = Date.now();
     for (let i = pendingDials.length - 1; i >= 0; i--) {
       if (now - pendingDials[i].createdAt > DIAL_REQUEST_TTL_MS) pendingDials.splice(i, 1);
     }
     const idx = pendingDials.findIndex((d) => d.token === token);
     const dial = idx === -1 ? null : pendingDials.splice(idx, 1)[0];
+    if (dial && dial.source && s.sipUser) {
+      clickContexts.set(s.sipUser, { to: dial.to, source: dial.source, at: now });
+    }
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({ dial: dial ? { id: dial.id, to: dial.to } : null }));
   }
@@ -1194,7 +1342,7 @@ const server = http.createServer(async (req, res) => {
       });
       console.log(`[backend] SIP direct sign-in: ${cleanUser} -> ${callerId}`);
       res.writeHead(200, { "Content-Type": "application/json" });
-      return res.end(JSON.stringify({ ok: true, token, sipUser: cleanUser, callerId }));
+      return res.end(JSON.stringify({ ok: true, token, sipUser: cleanUser, callerId, registrar: VOBIZ_REGISTRAR }));
     } catch (err) {
       res.writeHead(500, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({ error: err.message }));
@@ -1236,6 +1384,7 @@ const server = http.createServer(async (req, res) => {
         displayName: getAgentDisplayName(session.agentId),
         sipUser: `${session.sipUser}@${VOBIZ_REGISTRAR}`,
         sipPassword: session.sipPassword,
+        registrar: VOBIZ_REGISTRAR,
         registrarUrl: `wss://${VOBIZ_REGISTRAR}:5063/`,
       })
     );
@@ -1249,8 +1398,10 @@ const server = http.createServer(async (req, res) => {
     // Match the other party: the number dialled on an outbound call, the caller
     // on an inbound one.
     const otherParty = (c) => String(c.direction === "Inbound" ? c.from : c.to).replace(/[^\d+]/g, "");
+    // An inbound call that rang several panels belongs to the one that answered.
+    const notSomeoneElses = (c) => c.direction !== "Inbound" || !c.answeredBy || c.answeredBy === session.sipUser;
     const rec = recentCalls.find(
-      (c) => sessionMaySee(session, c) && (!wanted || otherParty(c).endsWith(wanted.slice(-10)))
+      (c) => sessionMaySee(session, c) && notSomeoneElses(c) && (!wanted || otherParty(c).endsWith(wanted.slice(-10)))
     );
     if (!rec) {
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -1419,16 +1570,37 @@ const server = http.createServer(async (req, res) => {
         return res.end(JSON.stringify({ error: "That call does not belong to this account." }));
       }
       const rec = found;
-      const recordingUrl = rec && rec.authId ? signCallPlaybackUrl(rec.authId, callUuid) : "";
+      // An inbound call rings every signed-in agent of the account, and every
+      // panel that rang reports it when its leg ends. Only the panel that
+      // answered may log it; a missed call is logged once by the backend.
+      // Enforced here, not trusted to the panels.
+      const inbound = rec ? rec.direction === "Inbound" : String(callDirection || "") === "Inbound";
+      if (inbound && (!rec || !rec.answeredBy || rec.answeredBy !== session.sipUser)) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        return res.end(
+          JSON.stringify({
+            success: true,
+            logged: false,
+            reason: !rec
+              ? "Inbound calls are logged only against a known call."
+              : rec.answeredBy
+                ? "Another agent answered this call; it is logged on their interaction."
+                : "This panel did not answer the call. A missed call is logged once by the backend.",
+          })
+        );
+      }
+      // This link goes into the record, so it gets the long lifetime.
+      const recordingUrl = rec && rec.authId ? signCallPlaybackUrl(rec.authId, callUuid, RECORD_LINK_TTL_SECONDS) : "";
 
       const result = await logCallToServiceNow(rec ? callUuid : null, {
-        to: toNumber || (rec && rec.to),
+        to: (rec && rec.to) || toNumber,
         from: (rec && rec.from) || session.from,
         durationSeconds: duration || (rec && rec.duration) || 0,
         recordingUrl,
-        callDirection: callDirection || (rec && rec.direction) || "Outbound",
+        callDirection: (rec && rec.direction) || callDirection || "Outbound",
         agentId: session.agentId,
         notes,
+        source: rec && rec.source,
       });
       res.writeHead(200, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({ success: true, result }));
@@ -1523,7 +1695,13 @@ const server = http.createServer(async (req, res) => {
 
       const { to } = body;
       // A signed-in caller can only ring its own panel.
-      const reqAgentId = caller ? caller.agentId : body.agentId;
+      const reqAgentId = String((caller ? caller.agentId : body.agentId) || "").trim();
+      if (!reqAgentId) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ error: "missing 'agentId': say which agent's panel should place the call" }));
+      }
+      // The record the button was pressed on, if the UI Action sent it.
+      const source = cleanSource(body.table, body.sysId || body.sys_id);
       if (!to) {
         res.writeHead(400, { "Content-Type": "application/json" });
         return res.end(JSON.stringify({ error: "missing 'to' number" }));
@@ -1545,22 +1723,28 @@ const server = http.createServer(async (req, res) => {
       const live = [...openPanels.entries()].filter(
         ([token, p]) => now - p.lastPollAt < PANEL_LIVE_MS && sessions.has(token)
       );
-      const wantedAgent = reqAgentId || "";
-      const mine = live.filter(([, p]) => wantedAgent && p.agentId === wantedAgent);
-      const target = mine.length ? mine[0] : !caller && live.length === 1 ? live[0] : null;
+      // Only a panel signed in as the requesting agent is ever rung. There is
+      // no "the only open panel" fallback: that panel may be another agent's,
+      // signed in to another Vobiz account, and would place a call billed to
+      // that account in that agent's name. A signed-in caller's session is
+      // further held to its own account.
+      const mine = live.filter(
+        ([, p]) => p.agentId === reqAgentId && (!caller || p.authId === caller.authId)
+      );
+      // The most recently polled panel of that agent takes it.
+      mine.sort((a, b) => b[1].lastPollAt - a[1].lastPollAt);
+      const target = mine[0] || null;
       if (!target) {
         res.writeHead(409, { "Content-Type": "application/json" });
         return res.end(
           JSON.stringify({
-            error: live.length
-              ? `No open Vobiz panel is signed in as ${wantedAgent || "this agent"}. Dial from your panel instead.`
-              : "No Vobiz panel is open and signed in. Open the Vobiz Calling panel, sign in, wait for Ready, and try again.",
+            error: `${reqAgentId} has no Vobiz panel open. Open the Vobiz Calling panel, sign in, wait for Ready, and try again.`,
           })
         );
       }
 
       const id = crypto.randomBytes(8).toString("hex");
-      pendingDials.push({ id, to: destination, token: target[0], createdAt: now });
+      pendingDials.push({ id, to: destination, token: target[0], source, createdAt: now });
       console.log(`[backend] Click-to-call queued for the softphone: ${destination} (agent ${target[1].agentId})`);
       res.writeHead(202, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({ queued: true, id, to: destination }));

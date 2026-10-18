@@ -78,14 +78,12 @@ is sent and the backend refuses — which is the intended behaviour, not a bug.
 ## The ServiceNow **Call via Vobiz** button fails with 409
 
 The button does not dial from the backend; it hands the number to your open
-softphone. A `409` means one of two things:
-
-- "No Vobiz panel is open and signed in": no softphone is open and signed in on
-  the **Vobiz account** tab (a SIP-direct sign-in does not receive these). Open
-  the panel, sign in, wait for **READY**, and press the button again.
-- "No open Vobiz panel is signed in as ...": several panels are open, and none
-  has your ServiceNow user name as its `agentId`. See
-  [Agent identity](../README.md#agent-identity).
+softphone, and only to yours. A `409` saying "<your user name> has no Vobiz
+panel open" means no softphone is open and signed in on the **Vobiz account**
+tab with your ServiceNow user name as its `agentId` (a SIP-direct sign-in does
+not receive these). Other agents' open panels are never used. Open the panel,
+sign in, wait for **READY**, and press the button again; if it is open, check
+[Agent identity](../README.md#agent-identity).
 
 ---
 
@@ -108,7 +106,9 @@ softphone. A `409` means one of two things:
    logged, not surfaced in the softphone.
 3. The record is created when the call ends, by the agent's softphone. If the
    panel was closed before the call ended, it is created when the recording is
-   ready instead.
+   ready instead. An inbound call is logged only by the panel that answered it;
+   the panels that only rang log nothing. A missed inbound call is logged once
+   by the backend, as missed, with 0 seconds.
 4. Records are assigned to the ServiceNow user whose user name equals the
    panel's `agentId`. If none matches, `assigned_to` is empty and the work notes
    name the agent.
@@ -140,9 +140,10 @@ expired).
 
 Both halves are real causes:
 
-- **Expired.** `RECORDING_URL_TTL_SECONDS` defaults to 300 seconds, so a link
-  in a work note stops working five minutes after it was written. Raise the
-  value if agents need to play recordings from older records.
+- **Expired.** A link in a work note lasts `RECORD_LINK_TTL_SECONDS`, 7 days
+  by default; a link the panel plays lasts `RECORDING_URL_TTL_SECONDS`, 300
+  seconds. Raise `RECORD_LINK_TTL_SECONDS` if agents need to play recordings
+  from older records.
 - **Invalid.** `SIGNING_SECRET` was not set, so it was regenerated on the last
   restart and every previously issued link is now unverifiable.
 

@@ -11,11 +11,30 @@
  * registered SIP endpoint.
  */
 
-const REGISTRAR_HOST = "registrar.vobiz.ai";
+// The registrar comes from the backend (VOBIZ_REGISTRAR), served on /session,
+// /login-sip and /agent. This is only the value used until it has answered.
+let registrarHost = "registrar.vobiz.ai";
 
 let backendUrl = "";
 let agentId = "";
-let registrarUrl = `wss://${REGISTRAR_HOST}:5063/`;
+let registrarUrl = `wss://${registrarHost}:5063/`;
+
+function applyRegistrar(host) {
+  const h = String(host || "").trim().toLowerCase();
+  if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+(:\d{1,5})?$/.test(h)) return;
+  registrarHost = h.replace(/:\d+$/, "");
+  registrarUrl = `wss://${registrarHost}:5063/`;
+}
+
+// An inbound call's From is our own DID (Vobiz requires that as callerId);
+// the backend puts the customer's number in callerName, which arrives as the
+// SIP display name. Prefer it whenever it is a phone number.
+function inboundCallerFrom(session) {
+  const ident = (session && session.remote_identity) || {};
+  const display = String(ident.display_name || "").trim();
+  if (/^\+?\d{6,16}$/.test(display.replace(/[\s().-]/g, ""))) return display.replace(/[\s().-]/g, "");
+  return (ident.uri && ident.uri.user) || "Unknown caller";
+}
 
 let sessionToken = "";
 let vobizUA = null;
@@ -317,7 +336,6 @@ async function sipDirectConnect() {
   writeStore(SIP_CREDS_KEY, remember ? { username, callerId } : null);
 
   const cleanUsername = username.includes("@") ? username.split("@")[0] : username;
-  const sipUser = `${cleanUsername}@${REGISTRAR_HOST}`;
   setLoginStatus(`Signing in as ${cleanUsername}…`);
 
   try {
@@ -334,12 +352,14 @@ async function sipDirectConnect() {
       sessionToken = sipSession.token;
       sessionStorage.setItem("vobiz_session_token", sessionToken);
     }
+    if (sipSession) applyRegistrar(sipSession.registrar);
   } catch (err) {
     console.warn("[Vobiz] Backend /login-sip note:", err.message);
     setLoginStatus(`Could not sign in: ${err.message}`);
     return;
   }
 
+  const sipUser = `${cleanUsername}@${registrarHost}`;
   setDialEnabled(true);
   startSipUA(sipUser, password, cleanUsername);
   setLoginStatus(`Signed in as ${cleanUsername} — calling from ${callerId}`);
@@ -367,6 +387,7 @@ async function restoreVobizSession() {
   try {
     const res = await backendFetch(`/session/${encodeURIComponent(agentId)}`);
     const session = await res.json().catch(() => ({}));
+    applyRegistrar(session.registrar);
     if (session.loggedIn) {
       renderNumberOptions(session.numbers, session.from, session.numberDetails, session.appId);
       setLoginStatus(`Logged in as ${session.authId} — calling from ${session.from}`);
@@ -792,6 +813,7 @@ async function initVobizSip() {
   }
 
   agentIdentity = agent;
+  applyRegistrar(agent.registrar);
   startSipUA(agent.sipUser, agent.sipPassword, agent.displayName);
 }
 
@@ -849,7 +871,7 @@ function startSipUA(sipUser, sipPassword, displayName) {
     vobizUA.on("newRTCSession", data => {
       if (data.originator !== "remote") return;
 
-      const remoteCaller = (data.session && data.session.remote_identity && data.session.remote_identity.uri && data.session.remote_identity.uri.user) || "Unknown caller";
+      const remoteCaller = inboundCallerFrom(data.session);
       callDirection = "Inbound";
       lastDialedNumber = remoteCaller;
       currentRTCSession = data.session;
@@ -859,7 +881,9 @@ function startSipUA(sipUser, sipPassword, displayName) {
       showIncoming(remoteCaller);
       startRingtone();
 
+      let answeredHere = false;
       currentRTCSession.on("confirmed", () => {
+        answeredHere = true;
         startTimer();
         setStatus("On a call", "busy");
         const numEl = document.getElementById("callnum");
@@ -878,7 +902,9 @@ function startSipUA(sipUser, sipPassword, displayName) {
           setTimeout(() => { numEl.hidden = true; }, 4000);
         }
         setHangupVisible(false);
-        autoLogCallToServiceNow();
+        // Only the panel that answered logs an inbound call (the backend
+        // enforces this too); a missed call is logged once by the backend.
+        if (answeredHere) autoLogCallToServiceNow();
         setTimeout(loadCallHistory, 5000);
       };
 
@@ -945,7 +971,7 @@ async function placeCall(number) {
   lastDialedNumber = number;
 
   const cleanNumber = String(number).replace(/[^\d+]/g, "");
-  const target = `sip:${cleanNumber}@${REGISTRAR_HOST}`;
+  const target = `sip:${cleanNumber}@${registrarHost}`;
 
   try {
     const session = vobizUA.call(target, {

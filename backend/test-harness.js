@@ -10,6 +10,8 @@ const MOCK_VOBIZ_PORT = 9094;
 const BASE = `http://localhost:${BACKEND_PORT}`;
 
 const SHARED_SECRET = "test_shared_secret";
+// Not the default, so the suite proves the registrar comes from VOBIZ_REGISTRAR.
+const REG = "sip.registrar.example.test";
 
 // Two unrelated Vobiz accounts, both fake. Nothing here is a real account.
 const ACCOUNTS = {
@@ -30,7 +32,7 @@ const DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "vobiz-sn-test-"));
 // configured: accounts arrive by signing in.
 const TEST_ENV = {
   ENV_FILE: path.join(__dirname, "does-not-exist.test.env"),
-  VOBIZ_REGISTRAR: "registrar.vobiz.ai",
+  VOBIZ_REGISTRAR: REG,
   VOBIZ_SHARED_SECRET: SHARED_SECRET,
   PORT: String(BACKEND_PORT),
   // HTTPS, so sign-in provisions — against the mock below. Nothing resolves.
@@ -48,6 +50,7 @@ const TEST_ENV = {
 // ─── Mock Vobiz + ServiceNow ─────────────────────────────────────────────────
 const vobizRequests = []; // { method, url, authId, rawBody }
 const serviceNowWrites = [];
+const sourceRecordWrites = [];
 const apps = { MA_TEST0001: [], MA_TEST0002: [] };
 const endpoints = {}; // endpointId -> { authId, username, application }
 let nextEndpoint = 87654321;
@@ -70,6 +73,11 @@ function handleMock(req, res, raw) {
   if (req.url.startsWith("/api/now/table/interaction")) {
     serviceNowWrites.push({ method: req.method, url: req.url, body: JSON.parse(raw || "{}") });
     return send(req.method === "POST" ? 201 : 200, { result: { sys_id: "sn_sys_1", number: "IMS0001001" } });
+  }
+  // Any other ServiceNow table: the record a click-to-call was started from.
+  if (req.url.startsWith("/api/now/table/")) {
+    sourceRecordWrites.push({ method: req.method, url: req.url, body: JSON.parse(raw || "{}") });
+    return send(200, { result: {} });
   }
 
   const m = req.url.match(/^\/api\/v1\/Account\/([^/]+)(\/.*)$/);
@@ -281,8 +289,10 @@ mockServer.listen(MOCK_VOBIZ_PORT, () => {
       const agentOne = await get("/agent", one.json.token);
       const agentTwo = await get("/agent", two.json.token);
       assert.strictEqual(agentOne.status, 200);
-      assert.strictEqual(agentOne.json.sipUser, `${epOne.username}@registrar.vobiz.ai`, "the username Vobiz stored is the one served");
-      assert.strictEqual(agentTwo.json.sipUser, `${epTwo.username}@registrar.vobiz.ai`);
+      assert.strictEqual(agentOne.json.sipUser, `${epOne.username}@${REG}`, "the username Vobiz stored is the one served");
+      assert.strictEqual(agentTwo.json.sipUser, `${epTwo.username}@${REG}`);
+      assert.strictEqual(agentOne.json.registrar, REG, "/agent serves the configured registrar");
+      assert.strictEqual(agentOne.json.registrarUrl, `wss://${REG}:5063/`);
       assert.notStrictEqual(agentOne.json.sipUser, agentTwo.json.sipUser, "two accounts, two distinct endpoints");
       assert.ok(agentOne.json.sipPassword && agentOne.json.sipPassword.length >= 12, "a fresh SIP password for this session");
       assert.strictEqual(agentOne.json.displayName, "Test Agent");
@@ -351,7 +361,7 @@ mockServer.listen(MOCK_VOBIZ_PORT, () => {
 
       // ── Inbound: routed by the dialled number ──
       const inTwo = await post("/answer", { CallUUID: "uuid_in_2", From: "+19998887777", To: "+12003004002" });
-      assert.ok(inTwo.text.includes(`<User>sip:${sipTwo}@registrar.vobiz.ai</User>`), "rings account two's agent");
+      assert.ok(inTwo.text.includes(`<User>sip:${sipTwo}@${REG}</User>`), "rings account two's agent");
       assert.ok(!inTwo.text.includes(sipOne), "and not account one's");
       assert.ok(inTwo.text.includes('callerId="+12003004002"'), "callerId is the dialled DID");
       const inOne = await post("/answer", { CallUUID: "uuid_in_1", From: "+19998887776", To: "12003004000" });
@@ -393,6 +403,13 @@ mockServer.listen(MOCK_VOBIZ_PORT, () => {
       const written = JSON.stringify(serviceNowWrites);
       assert.ok(!written.includes("tok_one") && !written.includes("tok_two"), "no Auth Token is written into ServiceNow");
       assert.ok(/play-recording\?callUuid=uuid_out_1&acct=MA_TEST0001&exp=\d+&sig=[0-9a-f]{64}/.test(written), "the work note carries an account-scoped signed link");
+      // Record links outlive panel links: 7 days by default, against 300 s.
+      const nowS = Math.floor(Date.now() / 1000);
+      const recordExps = [...written.matchAll(/exp=(\d+)/g)].map((m) => Number(m[1]) - nowS);
+      assert.ok(recordExps.length && recordExps.every((t) => t > 7 * 86400 - 120 && t <= 7 * 86400), "links written into ServiceNow last RECORD_LINK_TTL_SECONDS (7 days)");
+      const panelExp = Number(new URL(rec.json.recordingUrl).searchParams.get("exp")) - nowS;
+      assert.ok(panelExp > 0 && panelExp <= 300, "the panel's playback link keeps the short RECORDING_URL_TTL_SECONDS");
+      ok("record links last 7 days, panel playback links 300 s");
       assert.strictEqual(
         (await post("/sync-call", { callUuid: "uuid_out_1", toNumber: "+15550199" }, two.json.token)).status,
         403,
@@ -451,14 +468,33 @@ mockServer.listen(MOCK_VOBIZ_PORT, () => {
       assert.ok(!/\+\d{10,}/.test(html.text.replace(/placeholder="[^"]*"/g, "")) && !/["'`]\+\d{10,}/.test(appJs), "the panel hard-codes no number");
       ok("softphone UI is served with both sign-in modes");
 
+      // The panel takes the registrar from the backend and the inbound caller
+      // from callerName (the SIP display name), not the DID in the From user.
+      assert.ok(!/@registrar\.vobiz\.ai/.test(appJs) && !/REGISTRAR_HOST/.test(appJs), "no hard-coded registrar in a SIP URI");
+      assert.ok(/applyRegistrar\(agent\.registrar\)/.test(appJs) && /applyRegistrar\(session\.registrar\)/.test(appJs) && /applyRegistrar\(sipSession\.registrar\)/.test(appJs));
+      const callerFn = appJs.match(/function inboundCallerFrom\(session\) \{[\s\S]*?\n\}/)[0];
+      const inboundCallerFrom = new Function(`${callerFn}; return inboundCallerFrom;`)();
+      assert.strictEqual(inboundCallerFrom({ remote_identity: { display_name: "+19998887000", uri: { user: "+12003004000" } } }), "+19998887000", "callerName wins over the DID");
+      assert.strictEqual(inboundCallerFrom({ remote_identity: { display_name: "Vobiz", uri: { user: "+12003004000" } } }), "+12003004000", "a non-number display name is not used");
+      ok("the panel uses the backend's registrar and the real inbound caller");
+
       // ── Click-to-call ──
       const startCall = (headers) => post("/start-call", { to: "+91 00000-00001", agentId: "test-agent" }, null, headers);
       assert.strictEqual((await startCall({})).status, 401, "/start-call must be authenticated");
       assert.strictEqual((await startCall({ "X-Vobiz-Secret": "wrong" })).status, 401, "a wrong secret is refused");
       assert.strictEqual((await startCall({ "X-Vobiz-Secret": SHARED_SECRET })).status, 409, "no panel open");
+      // The only open panel is another agent's, on another Vobiz account. A
+      // request for test-agent must never reach it.
+      assert.strictEqual((await get("/dial-requests", two.json.token)).json.dial, null);
+      const notMine = await startCall({ "X-Vobiz-Secret": SHARED_SECRET });
+      assert.strictEqual(notMine.status, 409, "the single open panel is not used for another agent");
+      assert.strictEqual(notMine.json.error, "test-agent has no Vobiz panel open. Open the Vobiz Calling panel, sign in, wait for Ready, and try again.");
+      assert.strictEqual((await get("/dial-requests", two.json.token)).json.dial, null, "and nothing was queued for it");
+      const noAgent = await post("/start-call", { to: "+15550188" }, null, { "X-Vobiz-Secret": SHARED_SECRET });
+      assert.strictEqual(noAgent.status, 400, "a request that names no agent rings nobody");
+      assert.strictEqual((await get("/dial-requests", two.json.token)).json.dial, null);
       const poll = () => get("/dial-requests", one.json.token);
       assert.strictEqual((await poll()).json.dial, null);
-      await get("/dial-requests", two.json.token);
       const started = await startCall({ "X-Vobiz-Secret": SHARED_SECRET });
       assert.strictEqual(started.status, 202, "the number goes to test-agent's panel even with another account's panel open");
       assert.strictEqual(started.json.to, "+910000000001");
@@ -466,7 +502,97 @@ mockServer.listen(MOCK_VOBIZ_PORT, () => {
       assert.strictEqual((await poll()).json.dial.to, "+910000000001");
       assert.strictEqual((await poll()).json.dial, null, "each number is dialled once");
       assert.strictEqual(originatedOverRest, false, "the backend must not originate the call over REST");
-      ok("Call via Vobiz hands the number to the right agent's softphone");
+      // Agent B on account one also has a panel open; a request for test-agent
+      // still reaches only test-agent's panel, and one for B only B's.
+      const bLogin = await login("agent-b", "MA_TEST0001");
+      assert.strictEqual(bLogin.status, 200);
+      const bTok = bLogin.json.token;
+      assert.strictEqual((await get("/dial-requests", bTok)).json.dial, null);
+      assert.strictEqual((await startCall({ "X-Vobiz-Secret": SHARED_SECRET })).status, 202);
+      assert.strictEqual((await get("/dial-requests", bTok)).json.dial, null, "not to another agent of the same account");
+      assert.strictEqual((await get("/dial-requests", two.json.token)).json.dial, null, "nor another account's");
+      assert.strictEqual((await poll()).json.dial.to, "+910000000001");
+      // A signed-in caller rings its own panel only, whatever agentId it names.
+      const asTwo = await post("/start-call", { to: "+15550177", agentId: "test-agent" }, two.json.token);
+      assert.strictEqual(asTwo.status, 202);
+      assert.strictEqual((await poll()).json.dial, null, "a session cannot ring someone else's panel");
+      assert.strictEqual((await get("/dial-requests", two.json.token)).json.dial.to, "+15550177");
+      ok("Call via Vobiz rings only the requesting agent's panel, never another agent's or account's");
+
+      // ── Click-to-call ties the interaction to the record it started from ──
+      const incidentId = "0123456789abcdef0123456789abcdef";
+      const fromRecord = await post(
+        "/start-call",
+        { to: "+15550166", agentId: "test-agent", table: "incident", sysId: incidentId },
+        null,
+        { "X-Vobiz-Secret": SHARED_SECRET }
+      );
+      assert.strictEqual(fromRecord.status, 202);
+      assert.strictEqual((await poll()).json.dial.to, "+15550166");
+      await post("/answer", { CallUUID: "uuid_from_rec", From: `sip:${sipOne}@${REG}`, To: "+15550166", RouteType: "sip" });
+      await post("/dial-status", { CallUUID: "uuid_from_rec", DialStatus: "completed", DialBLegDuration: "12" });
+      const snBefore = serviceNowWrites.length;
+      assert.strictEqual((await post("/sync-call", { callUuid: "uuid_from_rec", toNumber: "+15550166", duration: 12 }, one.json.token)).status, 200);
+      const recWrite = serviceNowWrites.slice(snBefore).find((w) => w.method === "POST");
+      assert.ok(recWrite && recWrite.body.work_notes.includes(`Started from: incident ${incidentId}`), "the interaction names its source record");
+      const note = sourceRecordWrites.find((w) => w.url === `/api/now/table/incident/${incidentId}`);
+      assert.ok(note && note.method === "PATCH" && note.body.work_notes.includes("IMS0001001"), "and the source record gets a work note naming the interaction");
+      const badSource = await post(
+        "/start-call",
+        { to: "+15550165", agentId: "test-agent", table: "incident/../sys_user", sysId: incidentId },
+        null,
+        { "X-Vobiz-Secret": SHARED_SECRET }
+      );
+      assert.strictEqual(badSource.status, 202, "a malformed table is dropped, not used");
+      await poll();
+      ok("a click-to-call interaction is linked to the record it was started from");
+
+      // ── Inbound rings every agent; only the one who answered logs it ──
+      const sipB = Object.values(endpoints).find((e) => e.authId === "MA_TEST0001" && e.username !== sipOne).username;
+      const ringBoth = await post("/answer", { CallUUID: "uuid_in_multi", From: "+19998887000", To: "+12003004000" });
+      assert.ok(ringBoth.text.includes(`<User>sip:${sipOne}@${REG}</User>`) && ringBoth.text.includes(`<User>sip:${sipB}@${REG}</User>`), "both agents ring");
+      assert.ok(ringBoth.text.includes('callerId="+12003004000"') && ringBoth.text.includes('callerName="+19998887000"'), "callerName carries the real caller");
+      assert.ok(ringBoth.text.includes('callbackUrl="https://bridge.example.test/dial-events"'), "Dial events report who answered");
+      // A forged answer naming an agent who was not rung changes nothing.
+      await post("/dial-events", { Event: "DialAnswer", CallUUID: "uuid_in_multi", DialBLegTo: `sip:${sipTwo}@${REG}` });
+      await post("/dial-events", { Event: "DialAnswer", CallUUID: "uuid_in_multi", DialBLegTo: `sip:${sipB}@${REG}` });
+      await post("/dial-events", { Event: "DialAnswer", CallUUID: "uuid_in_multi", DialBLegTo: `sip:${sipOne}@${REG}` });
+      const multiBefore = serviceNowWrites.length;
+      assert.strictEqual((await get("/call-record?to=+19998887000", one.json.token)).json.found, false, "the panel that did not answer does not find the call");
+      const loser = await post("/sync-call", { callUuid: "uuid_in_multi", toNumber: "+19998887000", callDirection: "Inbound", duration: 0 }, one.json.token);
+      assert.strictEqual(loser.status, 200);
+      assert.strictEqual(loser.json.logged, false, "the panel that did not answer is ignored");
+      const blind = await post("/sync-call", { toNumber: "+19998887000", callDirection: "Inbound", duration: 0 }, one.json.token);
+      assert.strictEqual(blind.json.logged, false, "an inbound sync with no call is ignored");
+      assert.strictEqual(serviceNowWrites.length, multiBefore, "nothing written for either");
+      const bRec = await get("/call-record?to=+19998887000", bTok);
+      assert.strictEqual(bRec.json.callUuid, "uuid_in_multi", "the answering panel finds its call by the caller's number");
+      assert.strictEqual(bRec.json.from, "+19998887000");
+      const winner = await post("/sync-call", { callUuid: "uuid_in_multi", toNumber: "+19998887000", callDirection: "Inbound", duration: 30 }, bTok);
+      assert.notStrictEqual(winner.json.logged, false);
+      await post("/dial-status", { CallUUID: "uuid_in_multi", DialStatus: "completed", DialBLegTo: `sip:${sipB}@${REG}`, DialBLegDuration: "30" });
+      await new Promise((r) => setTimeout(r, 200));
+      const multiWrites = serviceNowWrites.slice(multiBefore);
+      assert.strictEqual(multiWrites.length, 1, "exactly one interaction for a call that rang two agents");
+      assert.ok(multiWrites[0].body.work_notes.includes("From: +19998887000") && multiWrites[0].body.work_notes.includes("To: +12003004000"), "from the customer, to our DID");
+      assert.ok(multiWrites[0].body.work_notes.includes("Agent: agent-b"), "assigned to the agent who answered");
+      ok("an inbound call that rang several agents is logged once, by the one who answered");
+
+      const missBefore = serviceNowWrites.length;
+      await post("/answer", { CallUUID: "uuid_in_missed", From: "+19998887001", To: "+12003004000" });
+      await post("/dial-status", { CallUUID: "uuid_in_missed", DialStatus: "no-answer", DialBLegDuration: "0" });
+      await post("/dial-status", { CallUUID: "uuid_in_missed", DialStatus: "no-answer", DialBLegDuration: "0" });
+      for (const t of [one.json.token, bTok]) {
+        const r = await post("/sync-call", { callUuid: "uuid_in_missed", toNumber: "+19998887001", callDirection: "Inbound", duration: 0 }, t);
+        assert.strictEqual(r.json.logged, false, "no panel logs a missed call");
+      }
+      await new Promise((r) => setTimeout(r, 200));
+      const missed = serviceNowWrites.slice(missBefore);
+      assert.strictEqual(missed.length, 1, "a missed call is logged once");
+      assert.strictEqual(missed[0].method, "POST");
+      assert.ok(/Missed/.test(missed[0].body.short_description) && missed[0].body.work_notes.includes("Duration: 0 seconds"), "as missed, 0 s");
+      assert.ok(!missed[0].body.assigned_to && !missed[0].body.work_notes.includes("Agent:"), "assigned to nobody");
+      ok("a missed inbound call is logged once, by the backend, as missed with 0 s");
 
       // ── SIP direct: an existing endpoint, no account credentials anywhere ──
       assert.strictEqual((await post("/login-sip", { sipUser: "deskphone01", callerId: "call me maybe" })).status, 400, "caller ID must be a number");
@@ -476,6 +602,7 @@ mockServer.listen(MOCK_VOBIZ_PORT, () => {
       assert.strictEqual(sipLogin.status, 200);
       assert.strictEqual(sipLogin.json.sipUser, "deskphone01");
       assert.strictEqual(sipLogin.json.callerId, "+12003004005", "caller ID normalised to E.164");
+      assert.strictEqual(sipLogin.json.registrar, REG, "SIP direct is told the configured registrar");
       const sipTok = sipLogin.json.token;
       const sipOut = await post("/answer", { CallUUID: "uuid_sip_out", From: "sip:deskphone01@registrar.vobiz.ai", To: "+15550120", RouteType: "sip" });
       assert.ok(sipOut.text.includes('callerId="+12003004005"') && sipOut.text.includes("<Number>+15550120</Number>"), "SIP direct dials out on its caller ID");
@@ -488,7 +615,7 @@ mockServer.listen(MOCK_VOBIZ_PORT, () => {
       });
       assert.ok(sipOutBad.text.includes('callerId="+12003004005"'), "a malformed header is ignored, not trusted");
       const sipIn = await post("/answer", { CallUUID: "uuid_sip_in", From: "+19998887771", To: "+12003004005", Direction: "inbound" });
-      assert.ok(sipIn.text.includes("<User>sip:deskphone01@registrar.vobiz.ai</User>") && sipIn.text.includes('callerId="+12003004005"'), "its number rings it");
+      assert.ok(sipIn.text.includes(`<User>sip:deskphone01@${REG}</User>`) && sipIn.text.includes('callerId="+12003004005"'), "its number rings it");
       for (const [p, method] of [["/recordings", "GET"], ["/setup-inbound", "POST"], ["/agent", "GET"], ["/dial-requests", "GET"], ["/select-number", "POST"]]) {
         const r = method === "GET" ? await get(p, sipTok) : await post(p, { number: "+12003004005" }, sipTok);
         assert.strictEqual(r.status, 403, `SIP direct cannot use ${p}`);
@@ -511,7 +638,10 @@ mockServer.listen(MOCK_VOBIZ_PORT, () => {
       assert.strictEqual((await get("/play-recording?callUuid=uuid_out_1")).status, 403, "unsigned play-recording refused");
       assert.strictEqual((await get("/agent/test-agent")).status, 401, "/agent needs a session");
       assert.strictEqual((await get("/agent/nobody")).status, 401);
-      assert.strictEqual((await get("/session/test-agent")).json.loggedIn, false, "an agent id in the path proves nothing");
+      const anon = await get("/session/test-agent");
+      assert.strictEqual(anon.json.loggedIn, false, "an agent id in the path proves nothing");
+      assert.deepStrictEqual(Object.keys(anon.json).sort(), ["loggedIn", "registrar"], "signed out, it says only which registrar to use");
+      assert.strictEqual(anon.json.registrar, REG);
       assert.strictEqual((await get("/recordings")).status, 401);
       assert.strictEqual((await post("/setup-inbound", {})).status, 401);
 

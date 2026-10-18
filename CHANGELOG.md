@@ -4,6 +4,32 @@ Notable changes to this integration. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and the project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+- **Call via Vobiz rings only the requesting agent's panel.** If that agent had
+  no panel open and exactly one panel was open on the backend, that panel was
+  rung, even another agent's on another Vobiz account. That fallback is gone:
+  the request is refused with "<user> has no Vobiz panel open". `agentId` is now
+  required.
+
+### Fixed
+- Inbound calls that rang several agents are logged once. The backend learns
+  which panel answered from the Dial events (`/dial-events`) and ignores
+  `/sync-call` from any other panel. A missed call is logged once by the
+  backend, as missed, with 0 seconds.
+- Inbound calls show and log the customer's number: it travels in the Dial's
+  `callerName`, since `callerId` has to be the account's own DID.
+- The softphone takes the registrar from the backend (`VOBIZ_REGISTRAR`)
+  instead of a hard-coded `registrar.vobiz.ai`.
+
+### Added
+- `RECORD_LINK_TTL_SECONDS` (default 7 days) for recording links written into
+  ServiceNow records; `RECORDING_URL_TTL_SECONDS` (300 s) now covers only links
+  the panel plays.
+- Call via Vobiz sends the record's table and sys_id. The interaction names the
+  record, and the backend writes a work note on it naming the interaction.
+
 ## [2.3.0] - 2026-10-18
 
 ### Changed

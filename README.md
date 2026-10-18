@@ -314,7 +314,8 @@ one configuration per agent (each for a group that contains only that agent), or
 have agents open the softphone in a browser tab at their own URL. Without an
 `agentId`, the browser makes up its own id and keeps it; calling and inbound
 work, but interactions are not assigned to the agent, and **Call via Vobiz**
-reaches the panel only when it is the only softphone open on the backend.
+cannot reach the panel: the button rings only a panel signed in as the person
+who pressed it, never another agent's.
 
 ## Using it
 
@@ -338,6 +339,15 @@ you press the button. ServiceNow shows "Calling +91XXXXXXXXXX from your Vobiz
 panel." and the panel dials within two seconds. If the panel is already on a
 call, it does not dial. A request no panel collects expires after 30 seconds.
 
+Only your own panel is rung: one whose `agentId` is your ServiceNow user name.
+If you have none open, ServiceNow shows "<your user name> has no Vobiz panel
+open" and nothing is dialled, even if other agents' panels are open.
+
+The call's interaction names the record you pressed the button on ("Started
+from: incident <sys_id>"), and the backend adds a work note to that record
+naming the interaction. Tables without work notes, such as `sys_user`, get no
+note.
+
 If your instance sends OpenFrame communication events when an agent clicks a
 phone number, the panel dials those too.
 
@@ -345,7 +355,8 @@ phone number, the panel dials those too.
 
 After **Enable inbound calls**, a call to the number rings every agent of that
 account who is signed in. The panel opens, plays a ring tone, and shows the
-incoming caller ID. Press **Accept** or Enter to answer, **Decline** or Escape
+customer's number (the backend passes it as the call's caller name, because the
+SIP caller ID has to be your own number). Press **Accept** or Enter to answer, **Decline** or Escape
 to reject. If nobody from the account is signed in, the caller hears "Sorry, no
 one is available to take your call right now" and the call ends.
 
@@ -365,12 +376,16 @@ the ServiceNow `interaction` table through the Table API:
 | `recording_url` | The recording link, if your `interaction` table has this field |
 
 When the recording is ready, the backend updates the same record: it fills
-`recording_url` and adds a work note with the recording link. Inbound calls
-that were missed or declined are logged too.
+`recording_url` and adds a work note with the recording link.
+
+An inbound call rings several agents but is logged once. The backend learns from
+Vobiz which panel answered, and only that panel's report is logged, assigned to
+that agent; the panels that only rang are ignored. A call nobody answers is
+logged once by the backend as `Vobiz Missed Inbound Call`, with 0 seconds and no
+agent.
 
 Logging needs `SERVICENOW_INSTANCE_URL`, `SERVICENOW_USER` and
-`SERVICENOW_PASSWORD`. If any is missing, calls work but nothing is logged. The
-record is not linked to the user, incident or case the call was placed from.
+`SERVICENOW_PASSWORD`. If any is missing, calls work but nothing is logged.
 
 ### Recordings
 
@@ -379,10 +394,10 @@ section of the panel lists the account's 10 most recent recordings with a
 player; press the refresh icon to reload it.
 
 Recording links, in the panel and in work notes, play through your backend.
-Each link is signed for one recording on one account and expires after
-`RECORDING_URL_TTL_SECONDS`, 300 seconds by default. A link in an older work
-note stops working when it expires; play the call from the panel instead, or
-raise `RECORDING_URL_TTL_SECONDS` (see [Limitations](#limitations)).
+Each link is signed for one recording on one account. Links the panel plays
+expire after `RECORDING_URL_TTL_SECONDS` (300 seconds by default); links written
+into interaction work notes expire after `RECORD_LINK_TTL_SECONDS` (7 days by
+default). After that, play the call from the panel.
 
 ## Configuration reference
 
@@ -395,14 +410,15 @@ environment take precedence.
 | `PORT` | No | `8092` | Port the backend listens on |
 | `VOBIZ_SHARED_SECRET` | Yes, for **Call via Vobiz** | none | Must equal the `vobiz.calling.shared_secret` property. Without it the button is refused. `SHARED_SECRET` is accepted as an alternative name |
 | `SIGNING_SECRET` | Yes, in production | Random at each start | Signs recording links. If unset, every link stops working when the backend restarts |
-| `RECORDING_URL_TTL_SECONDS` | No | `300` | How long a recording link stays valid, in seconds |
+| `RECORDING_URL_TTL_SECONDS` | No | `300` | How long a recording link the panel plays stays valid, in seconds |
+| `RECORD_LINK_TTL_SECONDS` | No | `604800` (7 days) | How long a recording link written into a ServiceNow interaction stays valid, in seconds |
 | `SERVICENOW_INSTANCE_URL` | Yes, for call logging | none | Your instance, such as `https://your-instance.service-now.com` |
 | `SERVICENOW_USER` | Yes, for call logging | none | ServiceNow user the backend logs calls as |
 | `SERVICENOW_PASSWORD` | Yes, for call logging | none | That user's password (HTTP basic authentication) |
 | `DATA_DIR` | No | `backend/data` | Where the backend keeps `endpoints.json`, the map of which SIP endpoint belongs to which agent on which account |
 | `ALLOWED_ORIGINS` | No | none | Extra browser origins allowed to call the backend, comma-separated. `https://*.service-now.com` and `localhost` are always allowed |
 | `VOBIZ_API_URL` | No | `https://api.vobiz.ai` | Vobiz API base URL. Leave the default |
-| `VOBIZ_REGISTRAR` | No | `registrar.vobiz.ai` | Vobiz SIP registrar. Leave the default; the softphone always uses `registrar.vobiz.ai` |
+| `VOBIZ_REGISTRAR` | No | `registrar.vobiz.ai` | Vobiz SIP registrar. The backend serves it to the softphone, which registers and places calls through it. Leave the default unless Vobiz gives you another |
 | `ENV_FILE` | No | `backend/.env` | Load settings from a different file. Set it in the environment, not in `.env` |
 
 `backend/agents.json` optionally sets a display name for each `agentId`:
@@ -454,8 +470,9 @@ backend's public URL) and `vobiz.calling.shared_secret` (equal to
 - **Recording links are signed and expire.** Each link works for one recording
   on one account until it expires. The backend fetches audio only from Vobiz
   hosts, and never from an address supplied in a request.
-- **Click-to-call is authenticated.** `/start-call` requires the shared secret
-  from ServiceNow or a signed-in session. Outgoing caller IDs must be numbers on
+- **Click-to-call is authenticated and per agent.** `/start-call` requires the
+  shared secret from ServiceNow or a signed-in session, and rings only a panel
+  signed in as the requesting agent, never another agent's or another account's. Outgoing caller IDs must be numbers on
   the signed-in account.
 - **Only allowed origins** (`*.service-now.com`, `localhost` and
   `ALLOWED_ORIGINS`) can call the backend from a browser.
@@ -466,7 +483,7 @@ backend's public URL) and `vobiz.calling.shared_secret` (equal to
 - **Recordings are visible across the account.** Any agent signed in with an
   account sees that account's recent recordings in the panel, and anyone who can
   read an interaction's work notes can play its recording until the link
-  expires.
+  expires (`RECORD_LINK_TTL_SECONDS`, 7 days by default).
 
 To report a security issue, see [SECURITY.md](SECURITY.md).
 
@@ -483,19 +500,18 @@ result (`DIAL RESULT status=... bleg=...`) and `RECORDING READY`. If `bleg` is
 | Sign-in says "This backend has no public HTTPS address" | `PUBLIC_BASE_URL` is unset and no tunnel is running | Set `PUBLIC_BASE_URL` to an `https://` URL, or run `npm run tunnel` |
 | Sign-in says "could not set up calling on this account" | Vobiz refused to create the application or the endpoint | The message names the step. Check the account is active and try again |
 | Caller-ID list says "No numbers found on this account" | The account has no active, voice-enabled number | Buy or activate a number in the Console, then sign in again |
-| Badge never reads **READY**, or shows "Registration failed" | The browser cannot reach `registrar.vobiz.ai` on port 5063, or another panel signed in with the same `agentId` | Allow secure WebSockets to `registrar.vobiz.ai:5063` through your network, and give each agent their own `agentId` |
+| Badge never reads **READY**, or shows "Registration failed" | The browser cannot reach the registrar (`registrar.vobiz.ai`, or `VOBIZ_REGISTRAR`) on port 5063, or another panel signed in with the same `agentId` | Allow secure WebSockets to `registrar.vobiz.ai:5063` through your network, and give each agent their own `agentId` |
 | "No microphone access" or "Microphone permission was denied" | The page is not served over HTTPS, or the browser blocked the microphone | Open the panel over HTTPS and allow the microphone. If the ServiceNow frame blocks it, open the softphone URL in its own tab |
 | SIP direct never reaches **READY** | Wrong SIP username or password | Check the endpoint's credentials in the Console |
 | Outbound call ends at once with "This phone is not signed in" | The backend restarted, or the session expired | Sign in again |
 | Call via Vobiz: "Status 401" | `vobiz.calling.shared_secret` is empty or differs from `VOBIZ_SHARED_SECRET` | Set both to the same value |
-| Call via Vobiz: "Status 409 ... No Vobiz panel is open and signed in" | No softphone is open and signed in with a Vobiz account | Open the panel, sign in on **Vobiz account**, wait for **READY**, press the button again |
-| Call via Vobiz: "Status 409 ... No open Vobiz panel is signed in as ..." | Your panel's `agentId` is not your ServiceNow user name | See [Agent identity](#agent-identity) |
+| Call via Vobiz: "Status 409 ... <user> has no Vobiz panel open" | You have no softphone open and signed in with a Vobiz account, or your panel's `agentId` is not your ServiceNow user name | Open the panel, sign in on **Vobiz account**, wait for **READY**, press the button again. See [Agent identity](#agent-identity) |
 | Call via Vobiz: "set the system property 'vobiz.calling.tunnel_url'" | Property missing or not `https://` | Create it with your backend's public URL |
 | Calls to your number are not answered, or reach another system | The number is not attached to this integration's application | Sign in and press **Enable inbound calls** for that number |
 | Caller hears "no one is available" | Nobody from that account is signed in | Have an agent sign in and wait for **READY** |
 | Everything stopped after a restart of the tunnel | The quick-tunnel hostname changed | Update the property and OpenFrame URL, sign in again, press **Enable inbound calls** again |
 | No interaction records appear | ServiceNow settings missing, or the user lacks access | Set all three `SERVICENOW_*` variables; the backend log shows `ServiceNow refused the interaction (HTTP 403)` if access is missing |
-| Recording link says "invalid or has expired" | The link is older than `RECORDING_URL_TTL_SECONDS`, or `SIGNING_SECRET` changed | Play the call from the panel; set `SIGNING_SECRET` and a longer TTL |
+| Recording link says "invalid or has expired" | A work-note link is older than `RECORD_LINK_TTL_SECONDS` (7 days), or `SIGNING_SECRET` changed | Play the call from the panel; set `SIGNING_SECRET`, or raise `RECORD_LINK_TTL_SECONDS` |
 | Recording link asks you to sign in again | The backend restarted and nobody from that account has signed in since | Sign in with that account, then open the link |
 | One-way or no audio | The network blocks the media path | Try another network; allow WebRTC media (UDP) through your firewall |
 
@@ -507,14 +523,15 @@ More detail: [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
   recording links for an account play only after someone from it signs in.
 - **Run one backend instance.** State is held in memory.
 - **Sessions last 12 hours**, after which agents sign in again.
-- **Recording links in work notes expire** after `RECORDING_URL_TTL_SECONDS`
-  (5 minutes by default). Raising it keeps them playable longer, for anyone who
+- **Recording links in work notes expire** after `RECORD_LINK_TTL_SECONDS`
+  (7 days by default). Raising it keeps them playable longer, for anyone who
   can see the work note.
 - **SIP direct** has no caller-ID list, inbound setup, recording playback or
   **Call via Vobiz**.
 - **Call via Vobiz needs the agent's panel open and READY**, and reaches the
-  right panel only when `agentId` is the agent's ServiceNow user name.
-- **Interactions are not linked** to the record the call was made from.
+  panel only when `agentId` is the agent's ServiceNow user name.
+- **The source record is linked by a work note**, not a reference field on the
+  interaction, and only on tables that have work notes.
 - **One call at a time** per panel. There is no hold, transfer or mute.
 - **Limits per call:** 30 seconds of ringing, 4 hours of talk, and 1 hour of
   recording.

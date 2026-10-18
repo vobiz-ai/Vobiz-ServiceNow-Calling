@@ -75,11 +75,14 @@ the browser (see `/dial-requests`).
 ```json
 {
   "to": "+91XXXXXXXXXX",
-  "agentId": "admin"
+  "agentId": "admin",
+  "table": "incident",
+  "sysId": "0123456789abcdef0123456789abcdef"
 }
 ```
-`agentId` picks the panel signed in as that agent; with exactly one panel open,
-that one is used.
+`agentId` is required and picks the panel signed in as that agent. No other
+panel is ever used. `table` and `sysId` (optional) name the record the call was
+started from; the interaction names it and the record gets a work note.
 
 #### Response (202 Accepted)
 ```json
@@ -87,10 +90,10 @@ that one is used.
 ```
 
 #### Error Responses
-- `400 Bad Request`: missing or malformed `to`.
+- `400 Bad Request`: missing or malformed `to`, or no `agentId`.
 - `401 Unauthorized`: invalid or missing `X-Vobiz-Secret`, and no account session.
-- `409 Conflict`: no signed-in softphone is open, or several are and none is
-  signed in as `agentId`.
+- `409 Conflict`: `"<agentId> has no Vobiz panel open..."`: no signed-in
+  softphone of that agent is open.
 
 ---
 
@@ -131,11 +134,12 @@ calling out; anything else is a customer calling the DID.
 
 #### Inbound (a customer calls the DID)
 `callerId` is the dialled DID, in E.164 (`0XXXXXXXXXX` becomes `+91XXXXXXXXXX`).
+`callerName` is the customer's number, which the softphone displays and logs.
 ```xml
 <Response>
   <Record … />
-  <Dial callerId="+91YYYYYYYYYY" timeout="30" timeLimit="14400" action="https://<bridge>/dial-status" method="POST" redirect="false">
-    <User>sip:<agent endpoint username>@registrar.vobiz.ai</User>
+  <Dial callerId="+91YYYYYYYYYY" callerName="+91XXXXXXXXXX" timeout="30" timeLimit="14400" action="https://<bridge>/dial-status" method="POST" redirect="false" callbackUrl="https://<bridge>/dial-events" callbackMethod="POST">
+    <User>sip:<agent endpoint username>@<VOBIZ_REGISTRAR></User>
     <!-- one <User> per signed-in agent of that account -->
   </Dial>
 </Response>
@@ -149,7 +153,14 @@ calling out; anything else is a customer calling the DID.
 The `action` URL of `<Dial>`. Vobiz posts the dial result (`DialStatus`,
 `DialHangupCause`, `DialBLegUUID`, `DialBLegDuration`); the backend stores it on
 the call and logs a `DIAL RESULT` line. An empty `DialBLegUUID` means the second
-leg was never created.
+leg was never created. For an inbound call nobody answered, the backend logs one
+`interaction` marked missed, with 0 seconds and no agent.
+
+### 3b. `POST /dial-events`
+The `callbackUrl` of the inbound `<Dial>`. On `DialAnswer` (or
+`DialConnected`), `DialBLegTo` names the SIP user that answered; the backend
+records it as the call's agent, if that user was one of those rung. Only that
+agent's `/sync-call` is logged for the call.
 
 ### 3a. `POST /hangup-callback`
 Accepted and logged; it changes nothing. The application's hangup URL is
@@ -168,6 +179,8 @@ CallUUID=<call uuid>&RecordingID=<recording id>&RecordUrl=https://...&RecordingD
 If the call is one the backend placed or answered since it started, the
 backend updates that call's `interaction` record in ServiceNow with a signed
 playback link (or creates the record, if the softphone has not logged it yet).
+Links written into ServiceNow last `RECORD_LINK_TTL_SECONDS` (7 days by
+default); links the panel plays last `RECORDING_URL_TTL_SECONDS` (300 s).
 
 ---
 
@@ -204,11 +217,14 @@ and the password set at this sign-in. Sent with `Cache-Control: no-store`.
 ```json
 {
   "displayName": "Admin User",
-  "sipUser": "<endpoint username>@registrar.vobiz.ai",
+  "sipUser": "<endpoint username>@<VOBIZ_REGISTRAR>",
   "sipPassword": "<random, set at this sign-in>",
-  "registrarUrl": "wss://registrar.vobiz.ai:5063/"
+  "registrar": "<VOBIZ_REGISTRAR>",
+  "registrarUrl": "wss://<VOBIZ_REGISTRAR>:5063/"
 }
 ```
+`/session` (signed in or not) and `/login-sip` also return `registrar`; the
+softphone uses it for registration and call URIs.
 
 - `401 Unauthorized`: no session.
 - `403 Forbidden`: a SIP-direct session (it registers with what the agent typed).

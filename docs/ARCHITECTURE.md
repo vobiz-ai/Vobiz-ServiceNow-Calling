@@ -7,7 +7,7 @@ How the pieces of Vobiz Calling for ServiceNow fit together. For setup, see the
 
 | Piece | Where it runs | What it does |
 | --- | --- | --- |
-| Softphone (`agent-phone/`) | The agent's browser, in the OpenFrame panel or a tab | A WebRTC SIP phone (JsSIP). Signs in, registers with `wss://registrar.vobiz.ai:5063`, places and answers calls, lists recordings |
+| Softphone (`agent-phone/`) | The agent's browser, in the OpenFrame panel or a tab | A WebRTC SIP phone (JsSIP). Signs in, registers with `wss://<VOBIZ_REGISTRAR>:5063` (served by the backend), places and answers calls, lists recordings |
 | Backend (`backend/server.js`) | Your server, on a public HTTPS address | Serves the softphone, signs agents in and sets up their Vobiz account, answers Vobiz webhooks, proxies recordings, writes to ServiceNow |
 | **Call via Vobiz** UI Action (`servicenow-app/ui-actions/`) | The ServiceNow server | Sends a record's phone number to the backend with the shared secret |
 | System properties (`servicenow-app/sys_properties/`) | ServiceNow | `vobiz.calling.tunnel_url` and `vobiz.calling.shared_secret` |
@@ -55,16 +55,19 @@ sequenceDiagram
     participant SN as ServiceNow (UI Action)
     participant Backend
     participant Softphone
-    SN->>Backend: POST /start-call {to, agentId} + X-Vobiz-Secret
-    Backend-->>SN: 202 queued (or 409 if no panel is open)
+    SN->>Backend: POST /start-call {to, agentId, table, sysId} + X-Vobiz-Secret
+    Backend-->>SN: 202 queued (or 409 if that agent has no panel open)
     Softphone->>Backend: GET /dial-requests (every 2 s)
     Backend-->>Softphone: {dial: {to}}
     Softphone->>Softphone: places the call
 ```
 
 The backend picks the open panel whose `agentId` equals the ServiceNow user name
-in the request. If no panel matches and exactly one panel is open, that panel is
-used. A queued number expires after 30 seconds.
+in the request, and only that agent's panel: if the agent has none open, the
+request is refused with "<user> has no Vobiz panel open", whatever other panels
+are open. A queued number expires after 30 seconds. The record the button was
+pressed on (`table`, `sysId`) travels with the number; the call's interaction
+names it, and the backend writes a work note on it naming the interaction.
 
 ## Inbound call
 
@@ -76,9 +79,15 @@ sequenceDiagram
     participant Softphone
     Customer->>Vobiz: calls +91XXXXXXXXXX
     Vobiz->>Backend: POST /answer (To=+91XXXXXXXXXX, ParentAuthID=MA_XXXXXXXX)
-    Backend-->>Vobiz: <Record/> + <Dial><User>sip:<agent>@registrar.vobiz.ai</User>...</Dial>
+    Backend-->>Vobiz: <Record/> + <Dial callerName="<customer>" callbackUrl=/dial-events><User>sip:<agent>@<VOBIZ_REGISTRAR></User>...</Dial>
     Vobiz->>Softphone: rings every signed-in agent of that account
+    Vobiz->>Backend: POST /dial-events (DialAnswer, DialBLegTo=<agent who answered>)
 ```
+
+`callerId` must be the account's own number, so the customer's number travels in
+`callerName`, and the panel shows and logs that. Only the panel that answered
+may log the call: the backend ignores a sync from any other panel. If nobody
+answers, the backend logs the call once, as missed, with 0 seconds.
 
 The backend finds the account from `ParentAuthID`, or from the dialled number.
 If no agent of that account is signed in, the caller hears a short apology and
