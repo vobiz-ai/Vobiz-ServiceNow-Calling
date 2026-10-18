@@ -697,12 +697,18 @@ async function bindEndpointToApp() {
   }
 
   if (VOBIZ_FROM_NUMBER) {
-    try {
-      const cleanNum = VOBIZ_FROM_NUMBER.replace(/[^\d+]/g, "");
-      await vobiz("POST", `/Number/${encodeURIComponent(cleanNum)}/`, { app_id: appId });
-      console.log(`[backend] Bound phone number ${cleanNum} to app ${appId}`);
-    } catch (e) {
-      console.warn("[backend] Note binding number:", e.message);
+    // Attaching a DID lives under the lowercase /numbers path, with the number
+    // URL-encoded (+ as %2B). /Number/<n>/ answers 401, which reads like bad
+    // credentials and left inbound calls unrouted.
+    const e164 = toE164(VOBIZ_FROM_NUMBER);
+    const attached = await vobiz("POST", `/numbers/${encodeURIComponent(e164)}/application`, {
+      application_id: appId,
+      app_id: appId,
+    });
+    if (attached.status >= 200 && attached.status < 300) {
+      console.log(`[backend] Attached ${e164} to app ${appId} for inbound calls`);
+    } else {
+      console.warn(`[backend] Could not attach ${e164} to app ${appId}: HTTP ${attached.status}`, JSON.stringify(attached.body).slice(0, 200));
     }
   }
 

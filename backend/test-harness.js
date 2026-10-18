@@ -24,7 +24,9 @@ const TEST_ENV = {
   VOBIZ_REGISTRAR: "registrar.vobiz.ai",
   VOBIZ_SHARED_SECRET: SHARED_SECRET,
   PORT: String(BACKEND_PORT),
-  TUNNEL_URL: `http://localhost:${BACKEND_PORT}`,
+  // HTTPS, so the backend provisions the Vobiz application at boot — against
+  // the mock below. Nothing here resolves.
+  TUNNEL_URL: "https://bridge.example.test",
   VOBIZ_API_URL: `http://localhost:${MOCK_VOBIZ_PORT}`,
   // ServiceNow is the mock below, never a real instance.
   SERVICENOW_INSTANCE_URL: `http://localhost:${MOCK_VOBIZ_PORT}`,
@@ -41,6 +43,7 @@ console.log("[test] Mock environment configured.");
 let lastVobizCallRequest = null;
 const recordingLookups = [];
 const serviceNowWrites = [];
+const provisioning = [];
 const mockVobizServer = http.createServer((req, res) => {
   // Mock ServiceNow Table API, on the same port.
   if (req.url.startsWith("/api/now/table/sys_user")) {
@@ -54,6 +57,22 @@ const mockVobizServer = http.createServer((req, res) => {
       serviceNowWrites.push({ method: req.method, url: req.url, body: JSON.parse(body || "{}") });
       res.writeHead(req.method === "POST" ? 201 : 200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ result: { sys_id: "sn_sys_1", number: "IMS0001001" } }));
+    });
+    return;
+  }
+
+  // Application provisioning at boot.
+  if (req.url.includes("/Application/") || req.url.includes("/Endpoint/") || /\/numbers\/[^/?]+\/application/.test(req.url)) {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      provisioning.push({ method: req.method, url: req.url, body: body ? JSON.parse(body) : null });
+      res.writeHead(200, { "Content-Type": "application/json" });
+      if (req.method === "GET" && req.url.includes("/Application/")) return res.end(JSON.stringify({ objects: [] }));
+      if (req.method === "POST" && req.url.includes("/Application/")) return res.end(JSON.stringify({ app_id: "app_1" }));
+      if (req.method === "GET" && req.url.includes("/Endpoint/"))
+        return res.end(JSON.stringify({ objects: [{ username: "testuser_abc", endpoint_id: "ep_1" }] }));
+      res.end("{}");
     });
     return;
   }
@@ -259,6 +278,16 @@ mockVobizServer.listen(MOCK_VOBIZ_PORT, () => {
       assert.ok(!written.includes("mock_auth_token") && !written.includes("mock_auth_id"), "no account credential is written into ServiceNow");
       assert.ok(/play-recording\?callUuid=uuid_outbound_test_1&exp=\d+&sig=[0-9a-f]{64}/.test(written), "the work note carries a signed link");
       console.log("[test] ✓ Test 5b Passed: one interaction per call, no credentials in it.");
+
+      // Test 5c: boot-time provisioning points the app at /answer and attaches
+      // the DID on the lowercase /numbers path, + encoded.
+      const createdApp = provisioning.find((r) => r.method === "POST" && r.url.endsWith("/Application/"));
+      assert.ok(createdApp && createdApp.body.answer_url === "https://bridge.example.test/answer", "app answer_url is /answer");
+      assert.ok(
+        provisioning.some((r) => r.method === "POST" && r.url.endsWith("/numbers/%2B12003004000/application")),
+        "the DID is attached at /numbers/%2B<E164>/application"
+      );
+      console.log("[test] ✓ Test 5c Passed: application provisioning.");
 
       // Test 6: Softphone agent info lookup
       console.log("[test] Test 6: Verifying softphone /agent/:agentId endpoint...");
