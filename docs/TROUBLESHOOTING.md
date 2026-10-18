@@ -9,10 +9,13 @@ cause entirely, so read the whole entry before acting on the error text.
 
 The tunnel hostname changed. Three things go stale together:
 
-1. `TUNNEL_URL` in `backend/.env` — or delete it and let `backend/tunnel-url.txt`
-   supply the value, which `npm run tunnel` rewrites for you
-2. the Vobiz application's `answer_url` — `POST /setup` with a session, or
-   press **Configure inbound** in the softphone
+1. `PUBLIC_BASE_URL` in `backend/.env`. Or delete it and let
+   `backend/tunnel-url.txt` supply the value, which `npm run tunnel` rewrites
+   for you.
+2. each account's application. Sign in again: sign-in finds or creates the
+   application for the new `/answer` URL and rebinds the agent's endpoint. Then
+   press **Enable inbound calls** for the inbound number. SIP-direct customers
+   change their application's answer URL in the Console.
 3. ServiceNow: the `vobiz.calling.tunnel_url` property **and** the OpenFrame
    configuration URL
 
@@ -26,11 +29,14 @@ still calling the old hostname.
 
 The status badge is the SIP registration, not the backend connection.
 
-- **Account mode**: the softphone fetches SIP credentials from `/agent`, which
-  now requires a session. If sign-in failed, registration never starts. Look for
-  `401` on `/agent` in the browser console.
-- **`VOBIZ_SIP_USER / VOBIZ_SIP_PASSWORD are not configured on this server`** —
-  exactly what it says; `/agent` refuses to invent credentials.
+- **Account mode**: sign-in creates the agent's endpoint and sets a fresh
+  password, and the softphone fetches both from `/agent`. If sign-in failed with
+  `502 … could not set up calling`, the message names the Vobiz step that was
+  refused. The backend log has an `Endpoint … bound to app …` line, or
+  `NOT confirmed bound` when Vobiz did not take the binding.
+- **The same agent id in two browsers**: each sign-in rotates that endpoint's
+  password, so the older tab stops registering. Give each agent their own
+  `agentId`.
 - **SIP-direct mode**: the password is proven by the REGISTER itself. A wrong
   password shows as "not Ready", with no sign-in error, because the backend
   never sees it.
@@ -68,7 +74,7 @@ is sent and the backend refuses — which is the intended behaviour, not a bug.
 
 The button does not dial from the backend; it hands the number to your open
 softphone. A `409` means no softphone is open and signed in with the Vobiz
-account (a SIP-direct sign-in does not receive these). Open the panel, sign in,
+account tab (a SIP-direct sign-in does not receive these). Open the panel, sign in,
 wait for **READY**, and press the button again.
 
 ---
@@ -104,6 +110,27 @@ that branch.
 3. The record is created when the **recording** callback arrives, not at hangup.
    A call with no recording produces no automatic interaction; use
    **Sync to CRM** in the softphone, which posts `/sync-call`.
+
+---
+
+## Outbound calls hang up at once with "This phone is not signed in"
+
+`/answer` did not recognise the SIP user in `From`. The backend restarted, or
+the agent signed out. Sign in again. In SIP direct, the endpoint must also be
+attached to an application whose answer URL is this backend.
+
+## Inbound calls play "no one is available" and hang up
+
+No signed-in agent belongs to the account that owns the number. The account is
+taken from `ParentAuthID`, or failing that from the dialled number. The log line
+says which. Sign in on that account, or as the SIP-direct endpoint whose caller
+ID is that number.
+
+## "Sign in again to play it" (HTTP 409) on a recording link
+
+The backend restarted, and the account's Auth Token lives only in memory. Once
+anyone from that account signs in, the link plays again (if it has not
+expired).
 
 ---
 
@@ -150,7 +177,7 @@ as a CORS failure with no detail.
 ## Reading the log
 
 ```
-WEBHOOK /answer received: {"From":"sip:…","To":"91…","RouteType":"sip"}
+WEBHOOK /answer received: CallUUID=… From=sip:… To=+1…
   -> Browser is A-leg: dialing out to 91… as callerId=+91…
 DIAL RESULT status=completed ring=true cause=NORMAL_CLEARING bleg=abc-123 dur=42
 RECORDING READY call=… id=…

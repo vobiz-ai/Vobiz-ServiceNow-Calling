@@ -7,10 +7,9 @@ This guide walks you through setting up the **Vobiz ServiceNow Calling Bridge** 
 ## 1. Prerequisites
 
 1. **Node.js 18+** installed on your workstation or host server.
-2. An active **Vobiz Developer Account** with:
-   - `VOBIZ_AUTH_ID`
-   - `VOBIZ_AUTH_TOKEN`
-   - An active Vobiz Outbound Phone Number (DID) for Caller ID.
+2. A **Vobiz account** with at least one active, voice-enabled number. Its
+   Auth ID and Auth Token are typed into the softphone by the agent. They are
+   not configured on the backend, and any Vobiz account can sign in.
 3. A **ServiceNow Instance** (Personal Developer Instance - PDI or enterprise instance).
 4. **Cloudflared** CLI (or any public tunneling solution / reverse proxy).
 
@@ -24,22 +23,14 @@ This guide walks you through setting up the **Vobiz ServiceNow Calling Bridge** 
    cp .env.example .env
    ```
 
-2. Open `backend/.env` and supply your credentials:
+2. Open `backend/.env`. It holds deployment settings only. There is no
+   Vobiz Auth ID, Auth Token, SIP user, SIP password or caller-ID number here:
    ```env
-   # Vobiz API Credentials
-   VOBIZ_AUTH_ID=your_vobiz_auth_id
-   VOBIZ_AUTH_TOKEN=your_vobiz_auth_token
-   VOBIZ_FROM_NUMBER=+12345678901
-
-   # The SIP endpoint the softphone registers as (the stored username Vobiz
-   # returns when you create it, not the one you submitted)
-   VOBIZ_SIP_USER=snagent1234567890
-   VOBIZ_SIP_PASSWORD=the_endpoint_password
-
-   # Local Server Port
    PORT=8092
+   # Public HTTPS address; unset = the tunnel's hostname (backend/tunnel-url.txt)
+   # PUBLIC_BASE_URL=https://calling-bridge.example.com
+   # DATA_DIR=./backend/data                    # endpoint ids per account+agent, mode 0600
 
-   # Optional Shared Secret between ServiceNow and Backend
    VOBIZ_SHARED_SECRET=your_secret_token_here   # required by the ServiceNow form button
    SIGNING_SECRET=your_recording_hmac_secret    # set it, or playback links die on restart
    ALLOWED_ORIGINS=                             # extra CORS origins, comma-separated
@@ -57,8 +48,9 @@ This guide walks you through setting up the **Vobiz ServiceNow Calling Bridge** 
      "admin": { "displayName": "ServiceNow Admin" }
    }
    ```
-   Never put a password in this file. The SIP password comes from
-   `VOBIZ_SIP_PASSWORD` and is served only to a signed-in softphone.
+   Never put a password or SIP identity in this file. Each agent's SIP endpoint
+   is created on their account at sign-in, with a fresh password served only to
+   that browser session.
 
 ---
 
@@ -119,7 +111,25 @@ Open the softphone — in the OpenFrame panel, or in a browser tab:
 ```
 https://<your-bridge-url>/agent-phone.html?agentId=<your ServiceNow user name>
 ```
-Sign in, allow the microphone, and wait for the badge to read **READY**.
+Pass a distinct `agentId` per agent. Each (account, agent id) pair gets its own
+SIP endpoint, so two agents sharing an id would keep resetting each other's
+password.
+
+Sign in on one of the two tabs:
+
+- **Vobiz account**: Auth ID and Auth Token from the Vobiz Console. The
+  backend checks them with Vobiz, finds or creates the integration's
+  application and your SIP endpoint, and fills the caller-ID dropdown with the
+  account's active, voice-enabled numbers. Press **Enable inbound calls** to
+  route the selected number to signed-in agents. The panel shows which
+  application the number is moving from.
+- **SIP direct**: an existing endpoint's SIP username and password plus an E.164
+  caller ID. The endpoint and the number must already be attached to an
+  application whose answer URL is `https://<your-bridge-url>/answer`. The README
+  has the Console steps and the API calls. Recordings and Enable inbound need the
+  account tab.
+
+Allow the microphone, and wait for the badge to read **READY**.
 
 Keep it open. When you click **Call via Vobiz** on a ServiceNow record, the
 bridge hands the record's number to this softphone, which places the call from

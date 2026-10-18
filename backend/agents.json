@@ -1,10 +1,8 @@
 {
   "test-agent": {
-    "displayName": "Test Agent",
-    "sipUser": "testagent@registrar.vobiz.ai"
+    "displayName": "Test Agent"
   },
   "admin": {
-    "displayName": "Admin User",
-    "sipUser": "admin@registrar.vobiz.ai"
+    "displayName": "Admin User"
   }
 }
