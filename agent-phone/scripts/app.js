@@ -74,7 +74,7 @@ async function init() {
   console.log(`[Vobiz] Softphone initializing. Agent: ${agentId}, Backend: ${backendUrl}`);
 
   wireUi();
-  initOpenFrame();
+  loadOpenFrameApi(urlParams);
 
   // Listen for click-to-dial messages from parent ServiceNow window
   window.addEventListener("message", onParentWindowMessage);
@@ -147,23 +147,64 @@ function wireUi() {
 
 // ─── ServiceNow OpenFrame Integration ────────────────────────────────────────
 
+// The OpenFrame API is served by the ServiceNow instance itself, so it has to be
+// loaded from there — it is not bundled here. The instance comes from
+// ?instance=<name> on the OpenFrame URL, or else from the page that framed us.
+// Only a *.service-now.com host is accepted: whatever host is named here gets
+// to run script in this panel, which holds the session.
+const SERVICENOW_HOST = /^[a-z0-9-]+\.service-now\.com$/i;
+
+function serviceNowInstanceHost(urlParams) {
+  const named = (urlParams.get("instance") || "").trim().toLowerCase();
+  if (named) {
+    const host = named.includes(".") ? named.replace(/^https?:\/\//, "").replace(/\/.*$/, "") : `${named}.service-now.com`;
+    return SERVICENOW_HOST.test(host) ? host : "";
+  }
+  try {
+    const host = new URL(document.referrer).hostname;
+    return SERVICENOW_HOST.test(host) ? host : "";
+  } catch {
+    return "";
+  }
+}
+
+function loadOpenFrameApi(urlParams) {
+  if (typeof window.openFrameAPI !== "undefined") return initOpenFrame();
+  const host = serviceNowInstanceHost(urlParams);
+  if (!host) {
+    console.log("[Vobiz] Not framed by a ServiceNow instance; running standalone.");
+    return;
+  }
+  const script = document.createElement("script");
+  script.src = `https://${host}/scripts/openframe/latest/openFrameAPI.min.js`;
+  script.onload = initOpenFrame;
+  script.onerror = () => console.warn(`[Vobiz] Could not load the OpenFrame API from ${host}.`);
+  document.head.appendChild(script);
+}
+
 function initOpenFrame() {
-  if (typeof window.openFrameAPI !== "undefined") {
-    try {
-      window.openFrameAPI.init({ height: 560, width: 380 });
-      window.openFrameAPI.subscribe(window.openFrameAPI.EVENTS.COMMUNICATION_EVENT, function(data) {
-        console.log("[Vobiz] OpenFrame communication event received:", data);
-        if (data && (data.telephoneNumber || data.phone || data.number)) {
-          const num = data.telephoneNumber || data.phone || data.number;
-          const input = document.getElementById("dialnumber");
-          if (input) input.value = num;
-          placeCall(num);
-        }
-      });
-      console.log("[Vobiz] ServiceNow OpenFrame API initialized successfully.");
-    } catch (e) {
-      console.warn("[Vobiz] OpenFrame initialization note:", e);
+  if (typeof window.openFrameAPI === "undefined") return;
+  const onCommunication = (data) => {
+    console.log("[Vobiz] OpenFrame communication event received:", data);
+    const num = data && (data.telephoneNumber || data.phone || data.number || data.phoneNumber);
+    if (num) {
+      const input = document.getElementById("dialnumber");
+      if (input) input.value = num;
+      placeCall(num);
     }
+  };
+  try {
+    // init must be the first call; subscribe once it has succeeded.
+    window.openFrameAPI.init(
+      { height: 560, width: 380, title: "Vobiz Calling" },
+      () => {
+        window.openFrameAPI.subscribe(window.openFrameAPI.EVENTS.COMMUNICATION_EVENT, onCommunication);
+        console.log("[Vobiz] ServiceNow OpenFrame API initialized.");
+      },
+      (err) => console.warn("[Vobiz] OpenFrame init failed:", err)
+    );
+  } catch (e) {
+    console.warn("[Vobiz] OpenFrame initialization note:", e);
   }
 }
 
