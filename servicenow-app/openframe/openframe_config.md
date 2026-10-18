@@ -1,40 +1,42 @@
-# ServiceNow OpenFrame / CTI Softphone Configuration
+# OpenFrame softphone panel
 
-ServiceNow **OpenFrame** enables embedding softphones and CTI telephony widgets directly inside the ServiceNow Agent Workspace or Next Experience header.
+OpenFrame puts the Vobiz softphone in the ServiceNow Next Experience header.
+It needs the **OpenFrame** plugin (`com.sn_openframe`) and a backend reachable
+over HTTPS.
 
----
+## Create the configuration
 
-## 1. Prerequisites
-- **OpenFrame plugin** (`com.sn_openframe`) active on your ServiceNow instance.
-- Vobiz Calling Bridge running and accessible via HTTPS.
+1. Go to **OpenFrame → Configurations** and click **New**.
+2. Fill in:
 
----
+   | Field | Value |
+   | --- | --- |
+   | Name | `Vobiz Softphone` |
+   | Title | `Vobiz Calling` |
+   | URL | `https://calling.example.com/agent-phone.html?instance=your-instance&agentId=<ServiceNow user name>` |
+   | Width | `380` |
+   | Height | `560` |
+   | User group | The agents who should see the panel |
+   | Active | checked |
 
-## 2. OpenFrame Configuration
+3. Click **Submit**.
 
-1. In the Filter Navigator, navigate to **OpenFrame** > **Configurations**.
-2. Click **New**.
-3. Set the following values:
-   - **Name**: `Vobiz Softphone`
-   - **Title**: `Vobiz Calling`
-   - **URL**: `https://<YOUR-TUNNEL-OR-BRIDGE-URL>/agent-phone.html?instance=<your-instance>&agentId=<user name>`
-     — `instance` is the `dev12345` in `dev12345.service-now.com`; the panel loads
-     the OpenFrame API from there. Without it the panel falls back to the framing
-     page's host. `agentId` is optional and only labels the agent.
-   - **Width**: `380`
-   - **Height**: `560`
-   - **User group**: `All` (or assign to specific support agent roles like `sn_customerservice_agent`)
-   - **Active**: `true`
-4. Click **Submit**.
+`instance` is the `your-instance` part of `your-instance.service-now.com`. The
+softphone loads the OpenFrame API from that instance; without it, it uses the
+host of the page that framed it.
 
----
+`agentId` should be the agent's ServiceNow user name. It decides which SIP
+endpoint the agent gets, lets **Call via Vobiz** find the agent's panel, and
+assigns logged calls to the agent. Every agent needs their own value. Because a
+configuration has one URL for its whole user group, create one configuration
+per agent, or have agents open the softphone URL in a browser tab. See
+[Agent identity](../../README.md#agent-identity) in the README.
 
-## 3. How It Works
-- The OpenFrame panel will appear in the top-right banner of the ServiceNow Next Experience header.
-- When clicked, it loads the WebRTC softphone interface directly inside the ServiceNow frame.
-- The softphone loads `https://<instance>.service-now.com/scripts/openframe/latest/openFrameAPI.min.js`,
-  initialises OpenFrame, and opens the panel on an incoming call.
+## What agents see
+
+- The panel opens from the phone icon in the header and shows the softphone.
+- It opens by itself when a call comes in.
 - **Call via Vobiz** on a record hands the number to the open, signed-in panel,
-  which dials it from the browser.
-- If the browser blocks the microphone inside the frame, run the softphone in
-  its own tab at the same URL instead; **Call via Vobiz** works the same way.
+  which dials it.
+- If the browser blocks the microphone inside the frame, open the same URL in
+  its own tab; calling and **Call via Vobiz** work the same way there.

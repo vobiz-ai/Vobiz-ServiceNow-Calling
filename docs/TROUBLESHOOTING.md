@@ -1,7 +1,8 @@
 # Troubleshooting
 
-Organised by symptom. Several of these fail with a message that names the wrong
-cause entirely, so read the whole entry before acting on the error text.
+Organised by symptom. The [README](../README.md#troubleshooting) has a short
+table; this page has more detail. Read the whole entry before acting on the
+error text.
 
 ---
 
@@ -40,8 +41,12 @@ The status badge is the SIP registration, not the backend connection.
 - **SIP-direct mode**: the password is proven by the REGISTER itself. A wrong
   password shows as "not Ready", with no sign-in error, because the backend
   never sees it.
-- Microphone permission must be granted **before** registration, and the page
-  must be HTTPS (or `localhost`) for `getUserMedia` to exist at all.
+- **Network:** the softphone registers over a secure WebSocket to
+  `registrar.vobiz.ai` on port 5063. A firewall or proxy that blocks it shows
+  as "Registration failed" or "Disconnected from registrar".
+- **Microphone:** the page must be HTTPS (or `localhost`) for the browser to
+  offer the microphone at all. Without it the panel says "No microphone access
+  - calls cannot connect".
 
 ---
 
@@ -73,20 +78,14 @@ is sent and the backend refuses — which is the intended behaviour, not a bug.
 ## The ServiceNow **Call via Vobiz** button fails with 409
 
 The button does not dial from the backend; it hands the number to your open
-softphone. A `409` means no softphone is open and signed in with the Vobiz
-account tab (a SIP-direct sign-in does not receive these). Open the panel, sign in,
-wait for **READY**, and press the button again.
+softphone. A `409` means one of two things:
 
----
-
-## The customer answers, hears ringback, then "the agent could not be reached"
-
-The classic symptom of the architecture that cannot work: something is dialling
-the customer first and trying to bridge the agent in with `<Dial><User>`.
-Routing into a registered WebRTC endpoint is blocked platform-side. The
-softphone must send the INVITE. Check that `/answer` returned
-`<Dial><Number>` — `RouteType=sip` or a `From` beginning `sip:` is what selects
-that branch.
+- "No Vobiz panel is open and signed in": no softphone is open and signed in on
+  the **Vobiz account** tab (a SIP-direct sign-in does not receive these). Open
+  the panel, sign in, wait for **READY**, and press the button again.
+- "No open Vobiz panel is signed in as ...": several panels are open, and none
+  has your ServiceNow user name as its `agentId`. See
+  [Agent identity](../README.md#agent-identity).
 
 ---
 
@@ -107,9 +106,12 @@ that branch.
    carries on.
 2. The user needs write access to `interaction`. A 403 from the Table API is
    logged, not surfaced in the softphone.
-3. The record is created when the **recording** callback arrives, not at hangup.
-   A call with no recording produces no automatic interaction; use
-   **Sync to CRM** in the softphone, which posts `/sync-call`.
+3. The record is created when the call ends, by the agent's softphone. If the
+   panel was closed before the call ended, it is created when the recording is
+   ready instead.
+4. Records are assigned to the ServiceNow user whose user name equals the
+   panel's `agentId`. If none matches, `assigned_to` is empty and the work notes
+   name the agent.
 
 ---
 
@@ -138,20 +140,21 @@ expired).
 
 Both halves are real causes:
 
-- **Expired.** `RECORDING_URL_TTL_SECONDS` defaults to 300 seconds. Links in old
-  work notes die.
+- **Expired.** `RECORDING_URL_TTL_SECONDS` defaults to 300 seconds, so a link
+  in a work note stops working five minutes after it was written. Raise the
+  value if agents need to play recordings from older records.
 - **Invalid.** `SIGNING_SECRET` was not set, so it was regenerated on the last
   restart and every previously issued link is now unverifiable.
 
-Open the recording from the softphone's recordings list to get a fresh link.
+Open the recording from the softphone's **Call recordings** list to get a fresh
+link.
 
 ---
 
 ## `/recording-file` returns HTTP 410
 
-Deliberate: this backend does not proxy a caller-supplied URL, because doing so
-with the account credentials attached would hand them to whatever host is named.
-Use the signed `/recording-audio/<recordingId>` link that `/recordings` returns.
+That route was removed. Use the signed `/recording-audio/<recordingId>` link
+that `/recordings` returns.
 
 ---
 
