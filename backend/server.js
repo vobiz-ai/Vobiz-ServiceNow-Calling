@@ -771,14 +771,6 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  if (pathname === "/agent-phone.bundle.js") {
-    const bundlePath = path.join(__dirname, "../agent-phone/agent-phone.bundle.js");
-    if (fs.existsSync(bundlePath)) {
-      res.writeHead(200, { "Content-Type": "application/javascript" });
-      return res.end(fs.readFileSync(bundlePath));
-    }
-  }
-
   // ── Webhooks (GET & POST) ──
   if (pathname === "/answer" || pathname === "/inbound-answer") {
     let body = {};

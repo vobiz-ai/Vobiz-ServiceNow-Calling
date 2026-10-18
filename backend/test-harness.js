@@ -320,6 +320,11 @@ mockVobizServer.listen(MOCK_VOBIZ_PORT, () => {
       assert.ok(phoneHtml.includes("Vobiz Calling for ServiceNow"), "HTML should include Vobiz branding");
       assert.ok(phoneHtml.includes('id="acceptbtn"'), "HTML should include incoming call popup buttons");
       assert.ok(phoneHtml.includes('id="mode-account-tab"'), "HTML should include login tabs");
+      // A space in the SIP User-Agent makes Vobiz drop its own INVITE to this
+      // endpoint, so inbound calls never ring. JsSIP's default has one.
+      const appJs = await (await fetch(`http://localhost:${BACKEND_PORT}/scripts/app.js`)).text();
+      const ua = (appJs.match(/user_agent:\s*"([^"]*)"/) || [])[1];
+      assert.ok(ua && !/\s/.test(ua), "the JsSIP user_agent must be set and contain no space");
       console.log("[test] ✓ Test 7 Passed: Softphone UI serving verified.");
 
       // Test 8: ServiceNow Form Button click-to-call (/start-call)

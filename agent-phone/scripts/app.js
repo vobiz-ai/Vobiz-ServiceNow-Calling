@@ -274,7 +274,6 @@ function setAuthMode(mode) {
     stopDialRequestPolling();
     const userField = document.getElementById("sip-username");
     const passField = document.getElementById("sip-password");
-    const callerField = document.getElementById("sip-caller-id");
     if (userField && !userField.value) {
       backendFetch(`/agent/${encodeURIComponent(agentId)}`)
         .then((r) => r.json())
@@ -283,16 +282,6 @@ function setAuthMode(mode) {
             const clean = agent.sipUser.split("@")[0].replace(/^sip:/, "");
             userField.value = clean;
             if (passField && !passField.value) passField.value = agent.sipPassword || "";
-          }
-        })
-        .catch(() => {});
-    }
-    if (callerField && !callerField.value) {
-      backendFetch("/numbers")
-        .then((r) => r.json())
-        .then((data) => {
-          if (data && data.selected && !callerField.value) {
-            callerField.value = data.selected;
           }
         })
         .catch(() => {});
@@ -320,7 +309,9 @@ async function sipDirectConnect() {
     return;
   }
 
-  writeStore(SIP_CREDS_KEY, remember ? { username, password, callerId } : null);
+  // Remember the username and caller ID only. A SIP password in localStorage
+  // is readable by any script on this origin and outlives the session.
+  writeStore(SIP_CREDS_KEY, remember ? { username, callerId } : null);
 
   const cleanUsername = username.includes("@") ? username.split("@")[0] : username;
   const sipUser = `${cleanUsername}@${REGISTRAR_HOST}`;
@@ -356,14 +347,11 @@ function restoreAuthMode() {
   const saved = readStore(SIP_CREDS_KEY);
   if (!saved || !saved.username) return;
   const set = (id, v) => { const el = document.getElementById(id); if (el) el.value = v || ""; };
+  if (saved.password) writeStore(SIP_CREDS_KEY, { username: saved.username, callerId: saved.callerId });
   set("sip-username", saved.username);
-  set("sip-password", saved.password);
   set("sip-caller-id", saved.callerId);
   const box = document.getElementById("sip-remember");
   if (box) box.checked = true;
-  if (saved.password && saved.callerId) {
-    sipDirectConnect();
-  }
 }
 
 // ─── Session & Account Auth ──────────────────────────────────────────────────
@@ -785,7 +773,7 @@ function startSipUA(sipUser, sipPassword, displayName) {
       password: sipPassword,
       display_name: displayName || sipUser,
       register: true,
-      user_agent: "VobizServiceNowCalling/2.0.0",
+      user_agent: "VobizServiceNowCalling/2.2.0",
       session_timers: false,
     });
 
