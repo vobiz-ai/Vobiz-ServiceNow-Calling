@@ -145,6 +145,43 @@ function requireSession(req, res) {
   return false;
 }
 
+/**
+ * Guard for routes that act on the whole account: listing or playing any
+ * recording, reconfiguring the Vobiz application, originating a call, choosing
+ * the account's caller ID.
+ *
+ * A SIP-direct session is not enough for these. /login-sip proves only that the
+ * caller knows one of the account's numbers — a number every customer who has
+ * been called already has — so its session is scoped to that agent's own calls.
+ */
+function requireAccountSession(req, res) {
+  const s = getSession(req);
+  if (!s) {
+    res.writeHead(401, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Sign in first" }));
+    return null;
+  }
+  if (s.mode === "sip") {
+    res.writeHead(403, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Sign in with the Vobiz account for this. A SIP-direct session covers your own calls only." }));
+    return null;
+  }
+  return s;
+}
+
+function isAccountSession(req) {
+  const s = getSession(req);
+  return Boolean(s && s.mode !== "sip");
+}
+
+// The calls a session may see: all of them for an account session, only the
+// agent's own endpoint's for a SIP-direct one.
+function sessionMaySee(session, rec) {
+  if (!session || !rec) return false;
+  if (session.mode !== "sip") return true;
+  return rec.agentSipUser === session.agentId;
+}
+
 function rememberCall(record) {
   callsByUuid.set(record.callUuid, record);
   recentCalls.unshift(record);
@@ -748,10 +785,12 @@ const server = http.createServer(async (req, res) => {
       if (VOBIZ_AUTH_ID && authId === VOBIZ_AUTH_ID && authToken === VOBIZ_AUTH_TOKEN) {
         isValid = true;
       } else if (VOBIZ_AUTH_ID) {
+        // Do not name the bound account here: this answer goes to anyone, and
+        // /health is careful not to publish the Auth ID either.
         res.writeHead(401, { "Content-Type": "application/json" });
         return res.end(
           JSON.stringify({
-            error: `This backend is bound to account ${VOBIZ_AUTH_ID}. You signed in as ${authId}.`,
+            error: "Invalid Vobiz Auth ID or Auth Token, or not the account this backend is configured for.",
           })
         );
       } else {
@@ -841,7 +880,9 @@ const server = http.createServer(async (req, res) => {
         .filter(Boolean));
       if (VOBIZ_FROM_NUMBER) owned.push(VOBIZ_FROM_NUMBER);
       const wanted = toE164(callerId);
-      if (owned.length > 0 && !owned.some((n) => toE164(n) === wanted)) {
+      // An empty list means the account could not be read, not that every
+      // number is fine: refuse rather than accept whatever was typed.
+      if (owned.length === 0 || !owned.some((n) => toE164(n) === wanted)) {
         res.writeHead(400, { "Content-Type": "application/json" });
         return res.end(
           JSON.stringify({ error: `${callerId} is not a number on this Vobiz account, so it cannot be a caller ID.` })
@@ -867,14 +908,19 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (pathname === "/select-number" && req.method === "POST") {
-    if (!requireSession(req, res)) return;
+    const s = requireAccountSession(req, res);
+    if (!s) return;
     try {
       const body = await readJsonBody(req);
       const { number } = body;
-      const s = getSession(req);
-      if (s) {
-        s.from = number;
+      // Same rule as /login-sip: the caller ID is a number the account owns,
+      // i.e. one of the numbers this session was given at sign-in.
+      const allowed = (s.numbers || []).map(toE164);
+      if (!number || !allowed.includes(toE164(number))) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ error: `${number} is not a number on this Vobiz account, so it cannot be a caller ID.` }));
       }
+      s.from = number;
       if (VOBIZ_SIP_USER) fromBySipUser.set(VOBIZ_SIP_USER, number);
       res.writeHead(200, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({ selected: number }));
@@ -923,9 +969,13 @@ const server = http.createServer(async (req, res) => {
   // ── CDR & Recordings ──
   if (pathname === "/call-record" && req.method === "GET") {
     if (!requireSession(req, res)) return;
+    const session = getSession(req);
     const wanted = String(queryParams.to || "").replace(/[^\d+]/g, "");
+    // Match the other party: the number dialled on an outbound call, the caller
+    // on an inbound one.
+    const otherParty = (c) => String(c.direction === "Inbound" ? c.from : c.to).replace(/[^\d+]/g, "");
     const rec = recentCalls.find(
-      (c) => !wanted || String(c.to).replace(/[^\d+]/g, "").endsWith(wanted.slice(-10))
+      (c) => sessionMaySee(session, c) && (!wanted || otherParty(c).endsWith(wanted.slice(-10)))
     );
     if (!rec) {
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -949,7 +999,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (pathname === "/recordings" || pathname.startsWith("/recordings/")) {
-    if (!requireSession(req, res)) return;
+    if (!requireAccountSession(req, res)) return;
     const limit = Math.min(Number(queryParams.limit || 15), 50);
     const r = await vobiz("GET", `/Recording/?limit=${limit}`);
     const objects = ((r.body && r.body.objects) || []).map((o) => ({
@@ -973,7 +1023,7 @@ const server = http.createServer(async (req, res) => {
     // be resolved to its own call is refused — never answered with whatever
     // recording is most recent.
     const signedFor = callUuid || recordingId;
-    if (!verifyRecordingSignature(signedFor, queryParams.exp, queryParams.sig) && !getSession(req)) {
+    if (!verifyRecordingSignature(signedFor, queryParams.exp, queryParams.sig) && !isAccountSession(req)) {
       res.writeHead(403, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({ error: "This playback link is invalid or has expired." }));
     }
@@ -1017,7 +1067,7 @@ const server = http.createServer(async (req, res) => {
     // signRecordingUrl() has always produced exp and sig for these links, but
     // nothing verified them: recording IDs were enumerable by anyone who could
     // reach the tunnel.
-    if (!verifyRecordingSignature(recordingId, queryParams.exp, queryParams.sig) && !getSession(req)) {
+    if (!verifyRecordingSignature(recordingId, queryParams.exp, queryParams.sig) && !isAccountSession(req)) {
       res.writeHead(403, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({ error: "Invalid or expired playback signature" }));
     }
@@ -1058,10 +1108,17 @@ const server = http.createServer(async (req, res) => {
   // ── CRM Write-back ──
   if (pathname === "/sync-call" && req.method === "POST") {
     if (!requireSession(req, res)) return;
+    const session = getSession(req);
     try {
       const body = await readJsonBody(req);
       const { toNumber, duration, callDirection, agentId, notes, callUuid } = body;
       const rec = callUuid ? callsByUuid.get(callUuid) : null;
+      // A SIP-direct session writes to ServiceNow only for a call its own
+      // endpoint made or took.
+      if (session.mode === "sip" && !sessionMaySee(session, rec)) {
+        res.writeHead(403, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ error: "That call does not belong to this endpoint." }));
+      }
       const recordingUrl = callUuid ? signCallPlaybackUrl(callUuid) : "";
 
       const result = await createServiceNowInteraction({
@@ -1083,7 +1140,7 @@ const server = http.createServer(async (req, res) => {
 
   // ── Setup Application ──
   if ((pathname === "/setup" || pathname === "/setup-inbound") && req.method === "POST") {
-    if (!requireSession(req, res)) return;
+    if (!requireAccountSession(req, res)) return;
     const result = await bindEndpointToApp();
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(
@@ -1106,7 +1163,7 @@ const server = http.createServer(async (req, res) => {
       // simply not configured.
       const providedSecret = req.headers["x-vobiz-secret"] || req.headers["x-api-key"] || body.secret;
       const secretOk = Boolean(VOBIZ_SHARED_SECRET) && providedSecret === VOBIZ_SHARED_SECRET;
-      if (!secretOk && !getSession(req)) {
+      if (!secretOk && !isAccountSession(req)) {
         res.writeHead(401, { "Content-Type": "application/json" });
         return res.end(
           JSON.stringify({

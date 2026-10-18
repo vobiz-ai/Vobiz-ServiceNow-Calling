@@ -346,6 +346,52 @@ mockVobizServer.listen(MOCK_VOBIZ_PORT, () => {
         !corsRes.headers.get("access-control-allow-origin"),
         "an unknown origin must not be echoed back as allowed"
       );
+      // A SIP-direct session needs only a number the account owns — which every
+      // customer who has been called already has. It must not reach the
+      // account's recordings, other agents' calls, the application config, the
+      // caller ID, or the button that originates billed calls.
+      const sipTok = sipLoginData.token;
+      const asSip = (p, init = {}) =>
+        fetch(`http://localhost:${BACKEND_PORT}${p}`, {
+          ...init,
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${sipTok}`, ...(init.headers || {}) },
+        });
+      assert.strictEqual((await asSip("/recordings")).status, 403, "SIP-direct must not list the account's recordings");
+      assert.strictEqual((await asSip("/setup", { method: "POST" })).status, 403, "SIP-direct must not reconfigure the account");
+      assert.strictEqual(
+        (await asSip("/start-call", { method: "POST", body: JSON.stringify({ to: "+15550199" }) })).status,
+        401,
+        "SIP-direct must not originate calls through /start-call"
+      );
+      assert.strictEqual(
+        (await asSip("/select-number", { method: "POST", body: JSON.stringify({ number: "+12003004000" }) })).status,
+        403,
+        "SIP-direct must not set the account caller ID"
+      );
+      assert.strictEqual(
+        (await (await asSip("/call-record?to=+15550199")).json()).found,
+        false,
+        "SIP-direct must not read another endpoint's calls"
+      );
+      assert.strictEqual(
+        (await asSip(`/play-recording?callUuid=uuid_outbound_test_1`)).status,
+        403,
+        "SIP-direct must not play recordings without a signed link"
+      );
+
+      // An account session may only pick a caller ID the account owns.
+      const asAcct = (p, body) =>
+        fetch(`http://localhost:${BACKEND_PORT}${p}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${loginData.token}` },
+          body: JSON.stringify(body),
+        });
+      assert.strictEqual((await asAcct("/select-number", { number: "+15555550123" })).status, 400, "caller ID must be owned");
+      assert.strictEqual((await asAcct("/select-number", { number: "+12003004001" })).status, 200, "an owned number is accepted");
+      await asAcct("/select-number", { number: "+12003004000" });
+
+      // A failed sign-in says nothing about which account the backend serves.
+      assert.ok(!JSON.stringify(await badLogin.json()).includes("mock_auth_id"), "/login must not name the bound account");
       console.log("[test] ✓ Test 9 Passed: all security properties held.");
 
       console.log("\n=========================");
