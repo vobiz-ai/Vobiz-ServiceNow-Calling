@@ -50,7 +50,7 @@ page here means every call will die silently.
 
 ## 4. Point Vobiz at it
 
-Sign in to the softphone at `$BASE/` and press **Configure inbound**, or
+Sign in to the softphone at `$BASE/` and press **Enable inbound calls**, or
 `POST /setup` with the session token. Either binds your DID and SIP endpoint to
 an application whose `answer_url` is this server.
 
@@ -78,7 +78,7 @@ For the softphone inside ServiceNow rather than a browser tab, follow
 Open the softphone, sign in, allow the microphone, and **wait for Ready** — that
 is the SIP registration landing, and dialling before it rings the customer into
 silence. Then dial, or press **Call via Vobiz** on a user record with a phone
-number.
+number: the button hands the number to your open panel, which places the call.
 
 ---
 
@@ -88,5 +88,7 @@ number.
   Re-run step 4.
 - `401` from the form button → `vobiz.calling.shared_secret` is empty or does
   not match `.env`.
+- `409` from the form button → no softphone is open and signed in with the
+  account. Open the panel, sign in, wait for Ready, press the button again.
 - Status never reads Ready → [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md),
   which is organised by symptom.

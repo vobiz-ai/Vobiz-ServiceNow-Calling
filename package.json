@@ -1,6 +1,6 @@
 {
   "name": "vobiz-servicenow-calling",
-  "version": "1.0.0",
+  "version": "2.2.0",
   "description": "Vobiz Calling Bridge for ServiceNow CRM with Browser-as-a-Leg WebRTC Architecture",
   "main": "backend/server.js",
   "scripts": {
@@ -19,5 +19,8 @@
     "cti"
   ],
   "author": "Vobiz AI",
-  "license": "MIT"
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  }
 }

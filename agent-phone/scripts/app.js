@@ -74,7 +74,7 @@ async function init() {
   console.log(`[Vobiz] Softphone initializing. Agent: ${agentId}, Backend: ${backendUrl}`);
 
   wireUi();
-  initOpenFrame();
+  loadOpenFrameApi(urlParams);
 
   // Listen for click-to-dial messages from parent ServiceNow window
   window.addEventListener("message", onParentWindowMessage);
@@ -147,23 +147,64 @@ function wireUi() {
 
 // ─── ServiceNow OpenFrame Integration ────────────────────────────────────────
 
+// The OpenFrame API is served by the ServiceNow instance itself, so it has to be
+// loaded from there — it is not bundled here. The instance comes from
+// ?instance=<name> on the OpenFrame URL, or else from the page that framed us.
+// Only a *.service-now.com host is accepted: whatever host is named here gets
+// to run script in this panel, which holds the session.
+const SERVICENOW_HOST = /^[a-z0-9-]+\.service-now\.com$/i;
+
+function serviceNowInstanceHost(urlParams) {
+  const named = (urlParams.get("instance") || "").trim().toLowerCase();
+  if (named) {
+    const host = named.includes(".") ? named.replace(/^https?:\/\//, "").replace(/\/.*$/, "") : `${named}.service-now.com`;
+    return SERVICENOW_HOST.test(host) ? host : "";
+  }
+  try {
+    const host = new URL(document.referrer).hostname;
+    return SERVICENOW_HOST.test(host) ? host : "";
+  } catch {
+    return "";
+  }
+}
+
+function loadOpenFrameApi(urlParams) {
+  if (typeof window.openFrameAPI !== "undefined") return initOpenFrame();
+  const host = serviceNowInstanceHost(urlParams);
+  if (!host) {
+    console.log("[Vobiz] Not framed by a ServiceNow instance; running standalone.");
+    return;
+  }
+  const script = document.createElement("script");
+  script.src = `https://${host}/scripts/openframe/latest/openFrameAPI.min.js`;
+  script.onload = initOpenFrame;
+  script.onerror = () => console.warn(`[Vobiz] Could not load the OpenFrame API from ${host}.`);
+  document.head.appendChild(script);
+}
+
 function initOpenFrame() {
-  if (typeof window.openFrameAPI !== "undefined") {
-    try {
-      window.openFrameAPI.init({ height: 560, width: 380 });
-      window.openFrameAPI.subscribe(window.openFrameAPI.EVENTS.COMMUNICATION_EVENT, function(data) {
-        console.log("[Vobiz] OpenFrame communication event received:", data);
-        if (data && (data.telephoneNumber || data.phone || data.number)) {
-          const num = data.telephoneNumber || data.phone || data.number;
-          const input = document.getElementById("dialnumber");
-          if (input) input.value = num;
-          placeCall(num);
-        }
-      });
-      console.log("[Vobiz] ServiceNow OpenFrame API initialized successfully.");
-    } catch (e) {
-      console.warn("[Vobiz] OpenFrame initialization note:", e);
+  if (typeof window.openFrameAPI === "undefined") return;
+  const onCommunication = (data) => {
+    console.log("[Vobiz] OpenFrame communication event received:", data);
+    const num = data && (data.telephoneNumber || data.phone || data.number || data.phoneNumber);
+    if (num) {
+      const input = document.getElementById("dialnumber");
+      if (input) input.value = num;
+      placeCall(num);
     }
+  };
+  try {
+    // init must be the first call; subscribe once it has succeeded.
+    window.openFrameAPI.init(
+      { height: 560, width: 380, title: "Vobiz Calling" },
+      () => {
+        window.openFrameAPI.subscribe(window.openFrameAPI.EVENTS.COMMUNICATION_EVENT, onCommunication);
+        console.log("[Vobiz] ServiceNow OpenFrame API initialized.");
+      },
+      (err) => console.warn("[Vobiz] OpenFrame init failed:", err)
+    );
+  } catch (e) {
+    console.warn("[Vobiz] OpenFrame initialization note:", e);
   }
 }
 
@@ -230,9 +271,9 @@ function setAuthMode(mode) {
   tab("mode-sip-tab", isSip);
 
   if (isSip) {
+    stopDialRequestPolling();
     const userField = document.getElementById("sip-username");
     const passField = document.getElementById("sip-password");
-    const callerField = document.getElementById("sip-caller-id");
     if (userField && !userField.value) {
       backendFetch(`/agent/${encodeURIComponent(agentId)}`)
         .then((r) => r.json())
@@ -241,16 +282,6 @@ function setAuthMode(mode) {
             const clean = agent.sipUser.split("@")[0].replace(/^sip:/, "");
             userField.value = clean;
             if (passField && !passField.value) passField.value = agent.sipPassword || "";
-          }
-        })
-        .catch(() => {});
-    }
-    if (callerField && !callerField.value) {
-      backendFetch("/numbers")
-        .then((r) => r.json())
-        .then((data) => {
-          if (data && data.selected && !callerField.value) {
-            callerField.value = data.selected;
           }
         })
         .catch(() => {});
@@ -278,7 +309,9 @@ async function sipDirectConnect() {
     return;
   }
 
-  writeStore(SIP_CREDS_KEY, remember ? { username, password, callerId } : null);
+  // Remember the username and caller ID only. A SIP password in localStorage
+  // is readable by any script on this origin and outlives the session.
+  writeStore(SIP_CREDS_KEY, remember ? { username, callerId } : null);
 
   const cleanUsername = username.includes("@") ? username.split("@")[0] : username;
   const sipUser = `${cleanUsername}@${REGISTRAR_HOST}`;
@@ -314,14 +347,11 @@ function restoreAuthMode() {
   const saved = readStore(SIP_CREDS_KEY);
   if (!saved || !saved.username) return;
   const set = (id, v) => { const el = document.getElementById(id); if (el) el.value = v || ""; };
+  if (saved.password) writeStore(SIP_CREDS_KEY, { username: saved.username, callerId: saved.callerId });
   set("sip-username", saved.username);
-  set("sip-password", saved.password);
   set("sip-caller-id", saved.callerId);
   const box = document.getElementById("sip-remember");
   if (box) box.checked = true;
-  if (saved.password && saved.callerId) {
-    sipDirectConnect();
-  }
 }
 
 // ─── Session & Account Auth ──────────────────────────────────────────────────
@@ -338,6 +368,7 @@ async function restoreVobizSession() {
       setDialEnabled(true);
       loadCallHistory();
       initVobizSip();
+      startDialRequestPolling();
     } else {
       setDialEnabled(false);
       initVobizSip();
@@ -376,6 +407,7 @@ async function vobizLogin() {
     setDialEnabled(true);
     loadCallHistory();
     initVobizSip();
+    startDialRequestPolling();
   } catch (err) {
     setLoginStatus(`Login failed: ${err.message}`);
     setDialEnabled(false);
@@ -741,7 +773,7 @@ function startSipUA(sipUser, sipPassword, displayName) {
       password: sipPassword,
       display_name: displayName || sipUser,
       register: true,
-      user_agent: "VobizServiceNowCalling/2.0.0",
+      user_agent: "VobizServiceNowCalling/2.2.0",
       session_timers: false,
     });
 
@@ -917,6 +949,46 @@ async function placeCall(number) {
     setLoginStatus(message);
     setHangupVisible(false);
   }
+}
+
+// ─── Click-to-call from a ServiceNow record ──────────────────────────────────
+//
+// The Call via Vobiz button runs on the ServiceNow server, so it cannot reach
+// this panel directly. It leaves the number with the backend, and this panel
+// collects it and dials it like any other — the browser stays the A leg.
+
+let dialPollTimer = null;
+
+function startDialRequestPolling() {
+  if (dialPollTimer) return;
+  const poll = async () => {
+    if (!sessionToken || authMode === "sip") return;
+    try {
+      const res = await backendFetch("/dial-requests");
+      if (res.status === 401 || res.status === 403) {
+        stopDialRequestPolling();
+        return;
+      }
+      const data = await res.json().catch(() => ({}));
+      if (data && data.dial && data.dial.to) {
+        const input = document.getElementById("dialnumber");
+        if (input) input.value = data.dial.to;
+        openOpenFrameIfAvailable();
+        if (currentRTCSession) {
+          setLoginStatus(`Call via Vobiz: already on a call, so ${data.dial.to} was not dialled.`);
+        } else {
+          placeCall(data.dial.to);
+        }
+      }
+    } catch { /* the next poll will try again */ }
+  };
+  poll();
+  dialPollTimer = setInterval(poll, 2000);
+}
+
+function stopDialRequestPolling() {
+  if (dialPollTimer) clearInterval(dialPollTimer);
+  dialPollTimer = null;
 }
 
 function hangUp() {

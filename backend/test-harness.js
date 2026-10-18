@@ -7,55 +7,76 @@ const path = require("path");
 const BACKEND_PORT = 8094;
 const MOCK_VOBIZ_PORT = 9094;
 
-// Set up mock agents
-const AGENTS_FILE = path.join(__dirname, "agents.json");
-const originalAgents = fs.existsSync(AGENTS_FILE) ? fs.readFileSync(AGENTS_FILE, "utf8") : "{}";
+const SHARED_SECRET = "test_shared_secret";
 
-// Setup dummy .env
-const ENV_FILE = path.join(__dirname, ".env");
-let envExisted = false;
-let originalEnv = "";
-if (fs.existsSync(ENV_FILE)) {
-  envExisted = true;
-  originalEnv = fs.readFileSync(ENV_FILE, "utf8");
-}
-
-fs.writeFileSync(
-  ENV_FILE,
-  `
-VOBIZ_AUTH_ID=mock_auth_id
-VOBIZ_AUTH_TOKEN=mock_auth_token
-VOBIZ_FROM_NUMBER=+12003004000
-VOBIZ_SIP_USER=testuser_abc
-VOBIZ_SIP_PASSWORD=testpassword123
-PORT=${BACKEND_PORT}
-TUNNEL_URL=http://localhost:${BACKEND_PORT}
-VOBIZ_API_URL=http://localhost:${MOCK_VOBIZ_PORT}
-`,
-  "utf8"
-);
-
-// Write dummy test agent config
-fs.writeFileSync(
-  AGENTS_FILE,
-  JSON.stringify(
-    {
-      "test-agent": {
-        displayName: "Test Agent",
-        sipUser: "testuser_abc@registrar.vobiz.ai",
-      },
-    },
-    null,
-    2
-  ),
-  "utf8"
-);
+// The backend gets its configuration from the environment of the child process.
+// Nothing is written to backend/.env or agents.json, so a developer's real
+// configuration is never read, overwritten, or lost if the suite is killed.
+// Every setting is pinned, so values exported in your shell cannot leak in —
+// in particular, no ServiceNow instance is ever written to.
+const TEST_ENV = {
+  ENV_FILE: path.join(__dirname, "does-not-exist.test.env"),
+  VOBIZ_AUTH_ID: "mock_auth_id",
+  VOBIZ_AUTH_TOKEN: "mock_auth_token",
+  VOBIZ_FROM_NUMBER: "+12003004000",
+  VOBIZ_SIP_USER: "testuser_abc",
+  VOBIZ_SIP_PASSWORD: "testpassword123",
+  VOBIZ_REGISTRAR: "registrar.vobiz.ai",
+  VOBIZ_SHARED_SECRET: SHARED_SECRET,
+  PORT: String(BACKEND_PORT),
+  // HTTPS, so the backend provisions the Vobiz application at boot — against
+  // the mock below. Nothing here resolves.
+  TUNNEL_URL: "https://bridge.example.test",
+  VOBIZ_API_URL: `http://localhost:${MOCK_VOBIZ_PORT}`,
+  // ServiceNow is the mock below, never a real instance.
+  SERVICENOW_INSTANCE_URL: `http://localhost:${MOCK_VOBIZ_PORT}`,
+  SERVICENOW_USER: "mock_sn_user",
+  SERVICENOW_PASSWORD: "mock_sn_password",
+  SIGNING_SECRET: "test_signing_secret",
+  ALLOWED_ORIGINS: "",
+  DEFAULT_AGENT_ID: "admin",
+};
 
 console.log("[test] Mock environment configured.");
 
 // Create Mock Vobiz API Server
 let lastVobizCallRequest = null;
+const recordingLookups = [];
+const serviceNowWrites = [];
+const provisioning = [];
 const mockVobizServer = http.createServer((req, res) => {
+  // Mock ServiceNow Table API, on the same port.
+  if (req.url.startsWith("/api/now/table/sys_user")) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ result: [] }));
+  }
+  if (req.url.startsWith("/api/now/table/interaction")) {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      serviceNowWrites.push({ method: req.method, url: req.url, body: JSON.parse(body || "{}") });
+      res.writeHead(req.method === "POST" ? 201 : 200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ result: { sys_id: "sn_sys_1", number: "IMS0001001" } }));
+    });
+    return;
+  }
+
+  // Application provisioning at boot.
+  if (req.url.includes("/Application/") || req.url.includes("/Endpoint/") || /\/numbers\/[^/?]+\/application/.test(req.url)) {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      provisioning.push({ method: req.method, url: req.url, body: body ? JSON.parse(body) : null });
+      res.writeHead(200, { "Content-Type": "application/json" });
+      if (req.method === "GET" && req.url.includes("/Application/")) return res.end(JSON.stringify({ objects: [] }));
+      if (req.method === "POST" && req.url.includes("/Application/")) return res.end(JSON.stringify({ app_id: "app_1" }));
+      if (req.method === "GET" && req.url.includes("/Endpoint/"))
+        return res.end(JSON.stringify({ objects: [{ username: "testuser_abc", endpoint_id: "ep_1" }] }));
+      res.end("{}");
+    });
+    return;
+  }
+
   if (req.method === "GET" && req.url.includes("/numbers")) {
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(
@@ -87,6 +108,7 @@ const mockVobizServer = http.createServer((req, res) => {
   }
 
   if (req.method === "GET" && req.url.includes("/Recording/")) {
+    recordingLookups.push(req.url);
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(
       JSON.stringify({
@@ -112,7 +134,7 @@ mockVobizServer.listen(MOCK_VOBIZ_PORT, () => {
   // Start backend server
   console.log("[test] Starting backend/server.js...");
   const serverProc = spawn("node", [path.join(__dirname, "server.js")], {
-    env: { ...process.env, PORT: BACKEND_PORT },
+    env: { PATH: process.env.PATH, ...TEST_ENV },
   });
 
   serverProc.stdout.on("data", (data) => {
@@ -233,6 +255,40 @@ mockVobizServer.listen(MOCK_VOBIZ_PORT, () => {
       assert.strictEqual(callRecord.duration, 42);
       console.log("[test] ✓ Test 5 Passed: CDR dial status and query verified.");
 
+      // Test 5b: one interaction per call. The softphone reports the call when
+      // it hangs up and Vobiz reports it again when the recording is ready, and
+      // Vobiz posts that webhook form-encoded.
+      const syncRes = await fetch(`http://localhost:${BACKEND_PORT}/sync-call`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${loginData.token}` },
+        body: JSON.stringify({ callUuid: "uuid_outbound_test_1", toNumber: "+15550199", duration: 42 }),
+      });
+      assert.strictEqual(syncRes.status, 200);
+      await fetch(`http://localhost:${BACKEND_PORT}/recording-ready`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ CallUUID: "uuid_outbound_test_1", RecordingID: "rec_123", RecordingDuration: "40" }).toString(),
+      });
+      const creates = serviceNowWrites.filter((w) => w.method === "POST");
+      const updates = serviceNowWrites.filter((w) => w.method === "PATCH");
+      assert.strictEqual(creates.length, 1, "one interaction record per call");
+      assert.strictEqual(updates.length, 1, "the recording webhook updates that record");
+      assert.ok(updates[0].url.endsWith("/interaction/sn_sys_1"));
+      const written = JSON.stringify(serviceNowWrites);
+      assert.ok(!written.includes("mock_auth_token") && !written.includes("mock_auth_id"), "no account credential is written into ServiceNow");
+      assert.ok(/play-recording\?callUuid=uuid_outbound_test_1&exp=\d+&sig=[0-9a-f]{64}/.test(written), "the work note carries a signed link");
+      console.log("[test] ✓ Test 5b Passed: one interaction per call, no credentials in it.");
+
+      // Test 5c: boot-time provisioning points the app at /answer and attaches
+      // the DID on the lowercase /numbers path, + encoded.
+      const createdApp = provisioning.find((r) => r.method === "POST" && r.url.endsWith("/Application/"));
+      assert.ok(createdApp && createdApp.body.answer_url === "https://bridge.example.test/answer", "app answer_url is /answer");
+      assert.ok(
+        provisioning.some((r) => r.method === "POST" && r.url.endsWith("/numbers/%2B12003004000/application")),
+        "the DID is attached at /numbers/%2B<E164>/application"
+      );
+      console.log("[test] ✓ Test 5c Passed: application provisioning.");
+
       // Test 6: Softphone agent info lookup
       console.log("[test] Test 6: Verifying softphone /agent/:agentId endpoint...");
 
@@ -264,29 +320,47 @@ mockVobizServer.listen(MOCK_VOBIZ_PORT, () => {
       assert.ok(phoneHtml.includes("Vobiz Calling for ServiceNow"), "HTML should include Vobiz branding");
       assert.ok(phoneHtml.includes('id="acceptbtn"'), "HTML should include incoming call popup buttons");
       assert.ok(phoneHtml.includes('id="mode-account-tab"'), "HTML should include login tabs");
+      // A space in the SIP User-Agent makes Vobiz drop its own INVITE to this
+      // endpoint, so inbound calls never ring. JsSIP's default has one.
+      const appJs = await (await fetch(`http://localhost:${BACKEND_PORT}/scripts/app.js`)).text();
+      const ua = (appJs.match(/user_agent:\s*"([^"]*)"/) || [])[1];
+      assert.ok(ua && !/\s/.test(ua), "the JsSIP user_agent must be set and contain no space");
       console.log("[test] ✓ Test 7 Passed: Softphone UI serving verified.");
 
-      // Test 8: ServiceNow Form Button click-to-dial (/start-call backward compatibility)
+      // Test 8: ServiceNow Form Button click-to-call (/start-call)
+      //
+      // The button must never originate a call from the backend: REST
+      // POST /Call/ + <Dial><User> leaves the customer listening to ringback.
+      // It hands the number to the agent's open softphone instead.
       console.log("[test] Test 8: Verifying ServiceNow UI Action trigger to /start-call...");
-      const startAnon = await fetch(`http://localhost:${BACKEND_PORT}/start-call`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ to: "+15550199", agentId: "test-agent" }),
-      });
-      assert.strictEqual(startAnon.status, 401, "/start-call originates a billed call and must be authenticated");
+      const startCall = (headers) =>
+        fetch(`http://localhost:${BACKEND_PORT}/start-call`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...headers },
+          body: JSON.stringify({ to: "+91 98765-43210", agentId: "test-agent" }),
+        });
+      assert.strictEqual((await startCall({})).status, 401, "/start-call must be authenticated");
+      assert.strictEqual((await startCall({ "X-Vobiz-Secret": "wrong" })).status, 401, "a wrong secret is refused");
 
-      const startRes = await fetch(`http://localhost:${BACKEND_PORT}/start-call`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${loginData.token}` },
-        body: JSON.stringify({
-          to: "+15550199",
-          agentId: "test-agent",
-        }),
+      const noPanel = await startCall({ "X-Vobiz-Secret": SHARED_SECRET });
+      assert.strictEqual(noPanel.status, 409, "with no softphone open there is nobody to place the call");
+
+      const poll = () =>
+        fetch(`http://localhost:${BACKEND_PORT}/dial-requests`, { headers: { Authorization: `Bearer ${loginData.token}` } }).then((r) => r.json());
+      assert.strictEqual((await poll()).dial, null, "an open panel with nothing queued gets nothing");
+
+      const startRes = await startCall({ "X-Vobiz-Secret": SHARED_SECRET });
+      assert.strictEqual(startRes.status, 202, "the number is handed to the open panel");
+      assert.strictEqual((await startRes.json()).to, "+919876543210");
+      assert.strictEqual((await poll()).dial.to, "+919876543210", "the panel collects the number to dial");
+      assert.strictEqual((await poll()).dial, null, "each number is dialled once");
+      assert.strictEqual(lastVobizCallRequest, null, "the backend must not originate the call over REST");
+
+      const sipPoll = await fetch(`http://localhost:${BACKEND_PORT}/dial-requests`, {
+        headers: { Authorization: `Bearer ${sipLoginData.token}` },
       });
-      assert.strictEqual(startRes.status, 201);
-      const startData = await startRes.json();
-      assert.strictEqual(startData.call_sid, "mock_call_sid_12345");
-      console.log("[test] ✓ Test 8 Passed: /start-call proxy succeeded.");
+      assert.strictEqual(sipPoll.status, 403, "a SIP-direct session does not receive click-to-call numbers");
+      console.log("[test] ✓ Test 8 Passed: Call via Vobiz hands the number to the softphone.");
 
       // ── Security properties ──
       //
@@ -312,6 +386,18 @@ mockVobizServer.listen(MOCK_VOBIZ_PORT, () => {
       // whatever recording is most recent.
       const unsignedPlay = await fetch(`http://localhost:${BACKEND_PORT}/play-recording?callUuid=uuid_outbound_test_1`);
       assert.strictEqual(unsignedPlay.status, 403, "/play-recording must demand a signature or a session");
+
+      // A link signed for one call cannot be stretched to another recording by
+      // adding a recordingId the signature does not cover.
+      const signedForCall = new URL(callRecord.recordingUrl);
+      recordingLookups.length = 0;
+      await fetch(
+        `http://localhost:${BACKEND_PORT}/play-recording${signedForCall.search}&recordingId=someone_elses_recording`
+      );
+      assert.ok(
+        !recordingLookups.some((u) => u.includes("someone_elses_recording")),
+        "a playback signature must cover the id that is actually looked up"
+      );
 
       // An agent id in the path is not a credential: it proves nothing without
       // a token, and leaks neither the Auth ID nor the account's numbers.
@@ -346,6 +432,52 @@ mockVobizServer.listen(MOCK_VOBIZ_PORT, () => {
         !corsRes.headers.get("access-control-allow-origin"),
         "an unknown origin must not be echoed back as allowed"
       );
+      // A SIP-direct session needs only a number the account owns — which every
+      // customer who has been called already has. It must not reach the
+      // account's recordings, other agents' calls, the application config, the
+      // caller ID, or the button that originates billed calls.
+      const sipTok = sipLoginData.token;
+      const asSip = (p, init = {}) =>
+        fetch(`http://localhost:${BACKEND_PORT}${p}`, {
+          ...init,
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${sipTok}`, ...(init.headers || {}) },
+        });
+      assert.strictEqual((await asSip("/recordings")).status, 403, "SIP-direct must not list the account's recordings");
+      assert.strictEqual((await asSip("/setup", { method: "POST" })).status, 403, "SIP-direct must not reconfigure the account");
+      assert.strictEqual(
+        (await asSip("/start-call", { method: "POST", body: JSON.stringify({ to: "+15550199" }) })).status,
+        401,
+        "SIP-direct must not originate calls through /start-call"
+      );
+      assert.strictEqual(
+        (await asSip("/select-number", { method: "POST", body: JSON.stringify({ number: "+12003004000" }) })).status,
+        403,
+        "SIP-direct must not set the account caller ID"
+      );
+      assert.strictEqual(
+        (await (await asSip("/call-record?to=+15550199")).json()).found,
+        false,
+        "SIP-direct must not read another endpoint's calls"
+      );
+      assert.strictEqual(
+        (await asSip(`/play-recording?callUuid=uuid_outbound_test_1`)).status,
+        403,
+        "SIP-direct must not play recordings without a signed link"
+      );
+
+      // An account session may only pick a caller ID the account owns.
+      const asAcct = (p, body) =>
+        fetch(`http://localhost:${BACKEND_PORT}${p}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${loginData.token}` },
+          body: JSON.stringify(body),
+        });
+      assert.strictEqual((await asAcct("/select-number", { number: "+15555550123" })).status, 400, "caller ID must be owned");
+      assert.strictEqual((await asAcct("/select-number", { number: "+12003004001" })).status, 200, "an owned number is accepted");
+      await asAcct("/select-number", { number: "+12003004000" });
+
+      // A failed sign-in says nothing about which account the backend serves.
+      assert.ok(!JSON.stringify(await badLogin.json()).includes("mock_auth_id"), "/login must not name the bound account");
       console.log("[test] ✓ Test 9 Passed: all security properties held.");
 
       console.log("\n=========================");
@@ -363,15 +495,6 @@ mockVobizServer.listen(MOCK_VOBIZ_PORT, () => {
         serverProc.kill();
       } catch {}
 
-      // Restore files
-      fs.writeFileSync(AGENTS_FILE, originalAgents, "utf8");
-      if (envExisted) {
-        fs.writeFileSync(ENV_FILE, originalEnv, "utf8");
-      } else {
-        try {
-          fs.unlinkSync(ENV_FILE);
-        } catch {}
-      }
       setTimeout(() => process.exit(process.exitCode || 0), 200);
     }
   }

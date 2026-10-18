@@ -31,6 +31,11 @@ This guide walks you through setting up the **Vobiz ServiceNow Calling Bridge** 
    VOBIZ_AUTH_TOKEN=your_vobiz_auth_token
    VOBIZ_FROM_NUMBER=+12345678901
 
+   # The SIP endpoint the softphone registers as (the stored username Vobiz
+   # returns when you create it, not the one you submitted)
+   VOBIZ_SIP_USER=snagent1234567890
+   VOBIZ_SIP_PASSWORD=the_endpoint_password
+
    # Local Server Port
    PORT=8092
 
@@ -45,17 +50,15 @@ This guide walks you through setting up the **Vobiz ServiceNow Calling Bridge** 
    SERVICENOW_PASSWORD=your_instance_admin_password
    ```
 
-3. Configure agent mappings in `backend/agents.json`:
-   Map ServiceNow user IDs (e.g. `admin`) to their corresponding Vobiz SIP endpoint credentials:
+3. Optionally set display names in `backend/agents.json`, keyed by the agent id
+   the softphone signs in with:
    ```json
    {
-     "admin": {
-       "displayName": "ServiceNow Admin",
-       "sipUser": "agentadmin12345@registrar.vobiz.ai",
-       "sipPassword": "AgentPassword123!"
-     }
+     "admin": { "displayName": "ServiceNow Admin" }
    }
    ```
+   Never put a password in this file. The SIP password comes from
+   `VOBIZ_SIP_PASSWORD` and is served only to a signed-in softphone.
 
 ---
 
@@ -91,7 +94,7 @@ In ServiceNow Filter Navigator, go to **System Properties** > **All Properties**
    - **Value**: the same secret as `VOBIZ_SHARED_SECRET` in `backend/.env`.
    - **Description**: Symmetric authentication secret between ServiceNow and the bridge.
 
-   `/start-call` originates a billed call, so it is not open. With this property
+   `/start-call` makes the agent's softphone place a billed call, so it is not open. With this property
    empty the UI Action sends no header and the bridge answers `401`. Generate
    one with `openssl rand -hex 32`.
 
@@ -112,11 +115,12 @@ In ServiceNow Filter Navigator, go to **System Properties** > **All Properties**
 
 ## 5. Agent Browser Softphone
 
-Open the agent softphone in a browser tab:
+Open the softphone — in the OpenFrame panel, or in a browser tab:
 ```
-http://localhost:8092/agent-phone.html?agentId=admin
+https://<your-bridge-url>/agent-phone.html?agentId=<your ServiceNow user name>
 ```
-The status indicator will show:
-- 🟢 **Ready — registered as ServiceNow Admin**
+Sign in, allow the microphone, and wait for the badge to read **READY**.
 
-Keep this tab open. When you click **Call via Vobiz** inside any ServiceNow record, the bridge dials the recipient and instantly connects audio to this browser tab.
+Keep it open. When you click **Call via Vobiz** on a ServiceNow record, the
+bridge hands the record's number to this softphone, which places the call from
+the browser. With no signed-in softphone open, the button reports `409`.

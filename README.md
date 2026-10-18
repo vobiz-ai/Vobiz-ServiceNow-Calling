@@ -91,9 +91,12 @@ read Ready**. That is the SIP registration landing; dialling before it rings the
 customer into silence.
 
 **From a record.** The **Call via Vobiz** UI Action on `sys_user` (or
-`incident`, `sn_customerservice_case`) posts to `/start-call`. It requires
+`incident`, `sn_customerservice_case`) posts the record's number to
+`/start-call`. The backend does not dial it: it hands the number to your open,
+signed-in softphone, which places the call from the browser like any other —
+so the panel must be open and **Ready** when you press the button. It requires
 `vobiz.calling.shared_secret` to be set and to match `VOBIZ_SHARED_SECRET` in
-`backend/.env` — the endpoint originates a billed call, so it is no longer open.
+`backend/.env`.
 
 **Inbound.** Call the DID bound to the Vobiz application. The softphone rings,
 shows the caller, and Accept/Decline are wired to Enter/Escape.
@@ -136,9 +139,14 @@ Vobiz has to call its webhooks. It is built accordingly.
 - **CORS is an allowlist** — `*.service-now.com`, localhost, and anything in
   `ALLOWED_ORIGINS`.
 - **`/health` reports whether things are configured, never what they are.**
-- **`/start-call` requires the shared secret or a session**, because it
-  originates a billed call.
-- **Caller ID must be a number the account owns.**
+- **`/start-call` requires the shared secret or an account session**, because
+  it makes the agent's softphone place a billed call. It never dials from the
+  backend.
+- **Caller ID must be a number the account owns**, at SIP-direct sign-in and
+  whenever it is changed.
+- **A SIP-direct session covers that agent's own calls only.** Account
+  recordings, provisioning, caller-ID selection and click-to-call need an
+  account sign-in.
 
 Two settings worth getting right before you go live: set `SIGNING_SECRET`
 explicitly, or playback links stop working at every restart, and set
@@ -155,11 +163,14 @@ Found a problem? `support@vobiz.ai` — see [SECURITY.md](SECURITY.md).
 npm test
 ```
 
-Starts a backend against a mock Vobiz API, drives both call directions through
-`/answer`, checks the CDR ledger, and asserts the security properties above —
-that unsigned playback is refused, that `/agent` and `/start-call` demand
-authentication, that `/health` reveals nothing, and that an unknown origin is not
-echoed back as allowed. It exits non-zero when any of that stops being true.
+Starts a backend against a mock Vobiz API and a mock ServiceNow Table API —
+never your real `backend/.env` or instance — drives both call directions through
+`/answer`, checks the CDR ledger, the one-record-per-call write-back, application
+provisioning and the click-to-call hand-off, and asserts the security
+properties above. It exits non-zero when any of that stops being true.
+
+It does not place a real call. Before rolling out, make one outbound and one
+inbound call on your own account and confirm two-way audio.
 
 ---
 
