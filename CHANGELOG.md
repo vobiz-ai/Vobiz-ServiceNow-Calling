@@ -4,6 +4,36 @@ Notable changes to this integration. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and the project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.0] - 2026-10-18
+
+### Changed
+- **Any Vobiz account can sign in.** The backend no longer has a Vobiz account
+  configured. `VOBIZ_AUTH_ID`, `VOBIZ_AUTH_TOKEN`, `VOBIZ_FROM_NUMBER`,
+  `VOBIZ_SIP_USER` and `VOBIZ_SIP_PASSWORD` are gone. Sign-in verifies the Auth
+  ID and Auth Token with Vobiz. It then finds or creates the integration's
+  application and the agent's own SIP endpoint on that account, with a fresh
+  password per sign-in. The endpoint ids go in `DATA_DIR/endpoints.json`, mode
+  0600.
+- Webhooks are multi-tenant. Outbound calls are matched by SIP username.
+  Inbound calls are matched by `ParentAuthID`, then by the dialled number.
+- The caller-ID dropdown lists every active, voice-enabled number on the
+  account, across all pages, and shows which application each is attached to.
+  The caller ID also travels as `X-VH-Caller-ID`, and the backend accepts only
+  numbers on that account's list.
+- **SIP direct** works with nothing configured. The agent types the endpoint's
+  SIP credentials and an E.164 caller ID; recordings and Enable inbound ask for
+  an account sign-in.
+- A number is attached to the application only by **Enable inbound calls**,
+  never at sign-in or startup.
+- `PUBLIC_BASE_URL` (or `PUBLIC_BASE`) names the public address; `TUNNEL_URL`
+  still works.
+
+### Security
+- Recording links are signed over account, id and expiry, and carry the account,
+  so one account's link cannot fetch another's audio.
+- The Auth Token is held in memory only. It is never in a response, a log or a
+  file.
+
 ## [2.2.0] - 2026-10-18
 
 ### Fixed

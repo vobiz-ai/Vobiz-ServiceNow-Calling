@@ -145,7 +145,12 @@ sequenceDiagram
   - Tracks calls by CallUUID across the asynchronous lifecycle: `answer` -> `dial-status` -> `recording-ready`, and keeps one interaction record per call.
   - Holds click-to-call numbers from `/start-call` until the agent's softphone collects them.
 - **Zero-Trust Security**:
-  - Vobiz Auth ID and Auth Token never leave the backend `.env` boundary.
+  - No Vobiz account is configured on the backend. An agent's Auth Token is
+    held in memory only, keyed by Auth ID, after it is verified with Vobiz at
+    sign-in. It is never returned, logged or written to disk.
+  - Multi-tenant: sign-in provisions the account's application and the agent's
+    endpoint, and webhooks find their account by SIP username (outbound) or by
+    `ParentAuthID` and then the dialled number (inbound).
   - No secret tokens are stored in browser client scripts or ServiceNow form scripts.
 - **Audio Recording Proxy**:
   - `GET /recording-audio/<recordingId>` streams recordings. The caller names an
@@ -166,12 +171,13 @@ sequenceDiagram
 
 | Threat / Risk | Mitigation Mechanism |
 | :--- | :--- |
-| **Vobiz Credential Leakage** | `VOBIZ_AUTH_ID` and `VOBIZ_AUTH_TOKEN` reside strictly on the backend Node.js server. Neither ServiceNow client scripts nor agents have access. |
+| **Vobiz Credential Leakage** | No Vobiz credential is configured. A signed-in account's Auth Token lives in backend memory only and never appears in a response, a log or a file. Each sign-in sets a fresh SIP password, served only to that session. |
+| **Cross-Account Access** | Every Vobiz call uses the session's (or webhook's) own account. Recording links sign `account|id|expiry`, and CDR lookups are filtered by account. |
 | **Unauthorized Call Triggering** | `/start-call` requires `X-Vobiz-Secret` (matching `VOBIZ_SHARED_SECRET`) or a session. It is never open: a server with no secret configured refuses rather than accepting anyone. |
 | **Plain-Text Credential Logging** | Console logs mask passwords and tokens; sanitized startup reporting verifies connectivity without printing secrets. |
 | **Public Recording Exposure** | Playback links are HMAC-signed and expire. The stream endpoint takes a recording id, resolves the URL server-side, and enforces a host allowlist — a caller cannot name the destination the account credentials are sent to. |
 | **Cross-Origin Abuse** | CORS is an allowlist (`*.service-now.com`, localhost, `ALLOWED_ORIGINS`). A wildcard would let any page on the internet drive this server. |
-| **Credential Disclosure via Metadata** | `/health` and `/session` report configuration state, not account identifiers. SIP credentials are served only to a signed-in caller and never written into the committed `agents.json`. |
+| **Credential Disclosure via Metadata** | `/health` reports counts, never account identifiers, numbers or SIP users. SIP credentials are served only to a signed-in caller. `agents.json` holds display names only, and `endpoints.json` holds ids only. |
 | **PII & Data Retention** | CDR records store standard call metadata (From, To, Duration, Timestamp). Phone numbers are handled over TLS in transit. |
 
 ---

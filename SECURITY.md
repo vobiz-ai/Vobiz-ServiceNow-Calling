@@ -12,12 +12,17 @@ working day.
 
 ## What this service holds
 
-A running instance holds, in `backend/.env`:
+A running instance holds:
 
-- a Vobiz **Auth ID and Auth Token** — enough to place calls billed to the
-  account and read every recording on it
-- a Vobiz **SIP endpoint password** — enough to register as the agent
-- **ServiceNow instance credentials** with write access to `interaction`
+- in memory only, the Vobiz **Auth Token of every account signed in to it**.
+  Each is enough to place calls billed to that account and read every recording
+  on it. They are never written to disk, logged or returned.
+- in memory only, the **SIP password set at each sign-in**, served only to that
+  browser session
+- in `backend/data/endpoints.json` (0600), endpoint **ids and usernames** per
+  account and agent, with no passwords
+- in `backend/.env`, **ServiceNow instance credentials** with write access to
+  `interaction`. No Vobiz credential goes in `.env`.
 
 It is normally exposed to the internet through a tunnel, because Vobiz has to
 reach `/answer`. Treat any endpoint on it as internet-facing, because it is.
@@ -36,18 +41,18 @@ carries its own authorisation. An endpoint that fetches a caller-supplied URL
 with credentials attached is a credential-exfiltration primitive, not merely
 SSRF.
 
-**Playback links prove themselves.** They are HMAC-signed with a short expiry.
+**Playback links prove themselves.** They are HMAC-signed over account, id and
+expiry, so a link can never be pointed at another account's audio.
 They end up in ServiceNow work notes, where every agent on the instance can read
 them for as long as the record exists, so they must never carry credentials and
 must expire.
 
 **Credentials are proven, not assumed.** Sign-in validates against Vobiz. There
-is no "looks like a key" fallback, including on a server not bound to an
-account.
+is no "looks like a key" fallback.
 
-**Secrets are served only to a session.** SIP credentials come from the
-environment and go only to a signed-in caller. `agents.json` is committed, so it
-holds display names and SIP usernames — never a password.
+**Secrets are served only to a session.** The SIP password is generated at sign-in
+and goes only to that session. `agents.json` is committed, so it holds display
+names only.
 
 **Unauthenticated endpoints describe, they do not reveal.** `/health` reports
 whether things are configured, not what they are.
@@ -55,7 +60,8 @@ whether things are configured, not what they are.
 **CORS is an allowlist.** `*.service-now.com`, localhost, and `ALLOWED_ORIGINS`.
 
 **Anything that spends money is authenticated.** `/start-call` requires the
-shared secret or a session; caller ID must be a number the account owns.
+shared secret or an account session; in account mode, caller ID must be on the
+account's own number list.
 
 ---
 

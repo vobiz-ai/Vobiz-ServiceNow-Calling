@@ -68,7 +68,7 @@
             </button>
           </div>
 
-          <!-- Signing in with the account. The backend holds the SIP identity. -->
+          <!-- Any Vobiz account. Sign-in sets up this agent's own SIP endpoint on it. -->
           <div id="mode-account" role="tabpanel" aria-labelledby="mode-account-tab">
             <p class="step-help">
               Your Auth ID and Auth Token are on the
@@ -100,7 +100,8 @@
           <!-- Signing in as one endpoint. -->
           <div id="mode-sip" role="tabpanel" aria-labelledby="mode-sip-tab" hidden>
             <p class="step-help">
-              The endpoint's own SIP credentials, from
+              For an endpoint you already have. It must be attached to an application
+              whose answer URL is this backend's <code>/answer</code>. The endpoint's own SIP credentials, from
               <a href="https://console.vobiz.ai" target="_blank" rel="noopener">Console</a> &rarr;
               Voice &rarr; Endpoints.
             </p>
@@ -119,7 +120,7 @@
               <label class="field-label" for="sip-caller-id">Calling from</label>
               <input type="tel" id="sip-caller-id" class="input input-mono" placeholder="+1XXXXXXXXXX" autocomplete="off" />
               <p class="hint">
-                The number outgoing calls show. Carriers reject a call without a real one.
+                A number on your Vobiz account. Outgoing calls show it, and calls to it ring this panel.
               </p>
             </div>
 
@@ -200,14 +201,15 @@
         <audio id="vobiz-remote-audio" autoplay></audio>
 
         <!-- Optional — inbound setup -->
-        <section class="step step-optional">
+        <section class="step step-optional" id="step-inbound">
           <div class="step-head">
             <span class="step-num step-num-optional">+</span>
             <h2 class="step-title">Receive calls here</h2>
           </div>
           <p class="step-help">
-            One-time setup. Configures your Vobiz number to route incoming calls to this softphone.
+            Routes calls to the caller ID chosen above to the agents signed in here. This moves that number off any other Vobiz application it was attached to.
           </p>
+          <p id="inbound-sip-note" class="hint" hidden>Sign in with your Vobiz account to use this.</p>
           <button id="setup-inbound-btn" class="btn btn-secondary" type="button">Enable inbound calls</button>
           <p id="inbound-setup-status" class="hint"></p>
         </section>

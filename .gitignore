@@ -16,3 +16,6 @@ Thumbs.db
 backend/cloudflared.exe
 cloudflared
 cloudflared.exe
+
+# Per-account endpoint map (ids only; written at sign-in, mode 0600)
+backend/data/
