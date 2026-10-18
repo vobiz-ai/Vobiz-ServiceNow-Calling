@@ -68,9 +68,13 @@
         r.setRequestHeader("Content-Type", "application/json");
         r.setRequestHeader("X-Vobiz-Secret", sharedSecret);
         
+        // table + sysId: the record this button was pressed on. The bridge
+        // writes a work note on it naming the interaction the call is logged as.
         var body = {
             to: phone,
-            agentId: agentId
+            agentId: agentId,
+            table: current.getTableName(),
+            sysId: current.getUniqueValue()
         };
         
         r.setRequestBody(JSON.stringify(body));
@@ -81,7 +85,8 @@
         var httpStatus = response.getStatusCode();
         
         // 202: the number was handed to your open Vobiz panel, which places the
-        // call from the browser. 409: no signed-in panel is open to place it.
+        // call from the browser. 409: you have no signed-in panel open (only
+        // your own panel is ever rung, never another agent's).
         if (httpStatus == 202) {
             gs.addInfoMessage("Calling " + phone + " from your Vobiz panel.");
         } else {
