@@ -12,12 +12,28 @@ const crypto = require("node:crypto");
 const fs = require("fs");
 const path = require("path");
 
-if (typeof process.loadEnvFile === "function") {
-  const envPath = path.join(__dirname, ".env");
-  if (fs.existsSync(envPath)) {
+// process.loadEnvFile only exists from Node 20.12, and this service supports
+// Node 18, where skipping .env would start an unconfigured server without a
+// word. Variables already in the environment win, as they do with loadEnvFile.
+function loadDotEnv(envPath) {
+  if (!fs.existsSync(envPath)) return;
+  if (typeof process.loadEnvFile === "function") {
     process.loadEnvFile(envPath);
+    return;
+  }
+  for (const line of fs.readFileSync(envPath, "utf8").split(/\r?\n/)) {
+    const m = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
+    if (!m || process.env[m[1]] !== undefined) continue;
+    let value = m[2].trim();
+    if (/^["']/.test(value)) {
+      value = value.slice(1, value.indexOf(value[0], 1) === -1 ? undefined : value.indexOf(value[0], 1));
+    } else {
+      value = value.replace(/\s+#.*$/, "");
+    }
+    process.env[m[1]] = value;
   }
 }
+loadDotEnv(path.join(__dirname, ".env"));
 
 const cleanEnvVar = (val) => (val ? val.trim().replace(/^["']|["']$/g, "") : "");
 
