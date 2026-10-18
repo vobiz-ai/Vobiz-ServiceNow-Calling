@@ -1,38 +1,38 @@
-# Vobiz ServiceNow Calling Bridge: API Specification
+# HTTP API reference
 
 ## Endpoints Summary
 
 All requests to the backend server accept and return JSON unless otherwise specified.
 
 No Vobiz account is configured on the server. Every route that touches Vobiz
-uses the account of the session (or, for webhooks, of the call). The examples
-use obvious fakes.
+uses the account of the session (or, for webhooks, of the call). You only need
+this reference to build your own client or debug one; the softphone and the
+**Call via Vobiz** button already use these routes.
 
 ---
 
 ### 0. `POST /login`: Vobiz account sign-in
 ```json
-{ "agentId": "admin", "authId": "MA_TEST0001", "authToken": "<typed by the agent>" }
+{ "agentId": "admin", "authId": "MA_XXXXXXXX", "authToken": "<typed by the agent>" }
 ```
 1. `GET /Account/{authId}/numbers?page=N&per_page=100` with those credentials,
    paged to `total`. Any non-2xx response gives `401` and stops here.
 2. Finds or creates this integration's application, matched on
    `answer_url = <PUBLIC_BASE_URL>/answer`.
 3. Finds or creates the agent's endpoint (stored id, else exact alias), sets a
-   fresh random password, and binds it with `{"app_id":"<id>"}`. A GET verifies
-   the binding; if it did not take, it retries with `{"application": <id>}`,
-   with the integer written directly into the body text.
+   fresh random password, and attaches it to the application. Application ids
+   are 17 digits, so they are kept as strings.
 4. Stores `{authId:agentId → endpointId, username}` in `DATA_DIR/endpoints.json`
    (mode 0600). The Auth Token and the password stay in memory.
 
 ```json
 {
   "token": "<session>",
-  "authId": "MA_TEST0001",
-  "numbers": ["+12003004000", "+12003004001"],
-  "numberDetails": [{ "e164": "+12003004000", "applicationId": "" }],
-  "appId": "43919358318796814",
-  "selected": "+12003004000"
+  "authId": "MA_XXXXXXXX",
+  "numbers": ["+91XXXXXXXXXX", "+91YYYYYYYYYY"],
+  "numberDetails": [{ "e164": "+91XXXXXXXXXX", "applicationId": "" }],
+  "appId": "12345678901234567",
+  "selected": "+91XXXXXXXXXX"
 }
 ```
 Only active, voice-enabled numbers are listed. `applicationId` is the
@@ -42,9 +42,9 @@ refused a provisioning step.
 
 ### 0a. `POST /login-sip`: SIP direct
 ```json
-{ "sipUser": "deskphone01", "callerId": "+1 200 300 4005" }
+{ "sipUser": "deskphone01", "callerId": "+91 XXXXX XXXXX" }
 ```
-Records `deskphone01 → +12003004005` for webhook routing (outbound caller ID,
+Records `deskphone01 → +91XXXXXXXXXX` for webhook routing (outbound caller ID,
 and the number whose inbound calls ring it). The SIP password stays in the
 browser, which registers with it directly. No account credentials are involved.
 Vobiz enforces that the caller ID is on the endpoint's account. `400` is
@@ -63,8 +63,7 @@ carries `previousAppId`, the application the number was moved from.
 ### 1. `POST /start-call`
 The **Call via Vobiz** UI Action's target. It originates nothing itself: it hands
 the number to the agent's open, signed-in softphone, which places the call from
-the browser (see `/dial-requests`). Dialling the customer from the backend and
-bridging the agent in with `<Dial><User>` does not work on Vobiz.
+the browser (see `/dial-requests`).
 
 #### Headers
 | Header | Type | Required | Description |
@@ -75,7 +74,7 @@ bridging the agent in with `<Dial><User>` does not work on Vobiz.
 #### Request Body
 ```json
 {
-  "to": "+15550199",
+  "to": "+91XXXXXXXXXX",
   "agentId": "admin"
 }
 ```
@@ -84,7 +83,7 @@ that one is used.
 
 #### Response (202 Accepted)
 ```json
-{ "queued": true, "id": "9f2c41aa07d3b6e1", "to": "+15550199" }
+{ "queued": true, "id": "9f2c41aa07d3b6e1", "to": "+91XXXXXXXXXX" }
 ```
 
 #### Error Responses
@@ -96,12 +95,12 @@ that one is used.
 ---
 
 ### 1a. `GET /dial-requests`
-Polled every two seconds by the softphone while it is signed in with the
+Polled every two seconds by the softphone while it is signed in with a Vobiz
 account. Returns the next number handed over by `/start-call`, once; requests
 expire after 30 seconds.
 
 ```json
-{ "dial": { "id": "9f2c41aa07d3b6e1", "to": "+15550199" } }
+{ "dial": { "id": "9f2c41aa07d3b6e1", "to": "+91XXXXXXXXXX" } }
 ```
 `{ "dial": null }` when there is nothing to dial. Requires an account session.
 
@@ -124,8 +123,8 @@ calling out; anything else is a customer calling the DID.
 ```xml
 <Response>
   <Record fileFormat="mp3" recordSession="true" maxLength="3600" redirect="false" callbackUrl="https://<bridge>/recording-ready" callbackMethod="POST"/>
-  <Dial callerId="+12003004000" timeout="30" timeLimit="14400" action="https://<bridge>/dial-status" method="POST" redirect="false">
-    <Number>+15550199</Number>
+  <Dial callerId="+91YYYYYYYYYY" timeout="30" timeLimit="14400" action="https://<bridge>/dial-status" method="POST" redirect="false">
+    <Number>+91XXXXXXXXXX</Number>
   </Dial>
 </Response>
 ```
@@ -135,7 +134,7 @@ calling out; anything else is a customer calling the DID.
 ```xml
 <Response>
   <Record … />
-  <Dial callerId="+12003004000" timeout="30" timeLimit="14400" action="https://<bridge>/dial-status" method="POST" redirect="false">
+  <Dial callerId="+91YYYYYYYYYY" timeout="30" timeLimit="14400" action="https://<bridge>/dial-status" method="POST" redirect="false">
     <User>sip:<agent endpoint username>@registrar.vobiz.ai</User>
     <!-- one <User> per signed-in agent of that account -->
   </Dial>
@@ -146,37 +145,29 @@ calling out; anything else is a customer calling the DID.
 
 ---
 
-### 3. `POST /hangup-callback`
-Vobiz Voice API webhook invoked when the call terminates.
+### 3. `POST /dial-status`
+The `action` URL of `<Dial>`. Vobiz posts the dial result (`DialStatus`,
+`DialHangupCause`, `DialBLegUUID`, `DialBLegDuration`); the backend stores it on
+the call and logs a `DIAL RESULT` line. An empty `DialBLegUUID` means the second
+leg was never created.
 
-#### Payload
-```json
-{
-  "CallUUID": "d4f3b5e1-8899-4c12-9c1a-9f4a62df89b2",
-  "Duration": "45",
-  "From": "+12003004000",
-  "To": "+15550199"
-}
-```
-
-#### Actions Taken
-1. Calculates call duration in seconds.
-2. Formats timestamp for ServiceNow.
-3. Logs it. The interaction record is written by `/sync-call` and
-   `/recording-ready`, once per call: the first creates it, the second updates it.
+### 3a. `POST /hangup-callback`
+Accepted and logged; it changes nothing. The application's hangup URL is
+`/answer`, which answers `Event=Hangup` with an empty `<Response>`.
 
 ---
 
-### 4. `POST /recording-callback`
-Vobiz Voice API webhook invoked when the audio recording finishes processing.
+### 4. `POST /recording-ready` (also `/recording-callback`)
+The `callbackUrl` of `<Record>`. Vobiz posts it, form-encoded, when the
+recording is ready:
 
-#### Payload
-```json
-{
-  "CallUUID": "d4f3b5e1-8899-4c12-9c1a-9f4a62df89b2",
-  "RecordUrl": "https://media.vobiz.ai/recordings/rec_abc123.mp3"
-}
 ```
+CallUUID=<call uuid>&RecordingID=<recording id>&RecordUrl=https://...&RecordingDuration=42
+```
+
+If the call is one the backend placed or answered since it started, the
+backend updates that call's `interaction` record in ServiceNow with a signed
+playback link (or creates the record, if the softphone has not logged it yet).
 
 ---
 
@@ -245,7 +236,7 @@ ID, a number or a SIP username.
 
 | Route | Requires |
 | --- | --- |
-| `/answer`, `/dial-status`, `/recording-ready`, `/hangup-callback` | Nothing — Vobiz calls these. Keep them fast and side-effect-safe. |
+| `/answer`, `/dial-status`, `/recording-ready`, `/hangup-callback` | Nothing. Vobiz calls these. Webhook signatures are not checked; the backend acts only for SIP users and numbers of accounts signed in to it. |
 | `/health` | Nothing |
 | `/login` | An Auth ID and Auth Token, which Vobiz verifies |
 | `/login-sip` | A SIP username and an E.164 caller ID; the SIP password is proven by the browser's REGISTER |

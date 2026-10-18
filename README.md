@@ -1,285 +1,554 @@
 # Vobiz Calling for ServiceNow
 
-A WebRTC softphone inside ServiceNow. Agents call from a record or from the
-OpenFrame panel, talk in the browser, and the call is written back to the
-ServiceNow `interaction` table with a playable recording link.
+Make and take phone calls inside ServiceNow with Vobiz. Your agents get a
+softphone in the ServiceNow header (or in a browser tab), call customers from a
+record with one click, talk through the browser, and every call is written to
+the ServiceNow `interaction` table with a link to its recording.
 
-[Docs](https://docs.vobiz.ai/integrations/servicenow) · [Quick start](QUICKSTART.md) · [Install](docs/SETUP_GUIDE.md) · [Architecture](docs/ARCHITECTURE.md) · [API](docs/API_SPECIFICATION.md) · [Troubleshooting](docs/TROUBLESHOOTING.md)
+You run a small Node.js backend that sits between ServiceNow, your agents'
+browsers and Vobiz. Agents sign in to the softphone with their own Vobiz
+account, so no Vobiz credentials live in the backend's configuration.
+
+**Features**
+
+- **Click-to-call from a record.** A **Call via Vobiz** button on user, contact,
+  incident or case forms dials the record's number from the agent's softphone.
+- **Softphone in ServiceNow.** The panel mounts in the Next Experience header
+  through OpenFrame, with a dial pad, a caller-ID picker and a call timer.
+- **Inbound calls.** Calls to your Vobiz number ring every signed-in agent of
+  that account. The panel opens itself and shows the incoming caller ID, with
+  Accept and Decline buttons (Enter and Escape on the keyboard).
+- **Call logging.** Each call becomes one `interaction` record with direction,
+  numbers, duration, the agent, and a recording link in the work notes.
+- **Recordings.** Every call is recorded. Agents play recent recordings in the
+  panel, and the interaction record links to the recording.
+- **Caller-ID choice.** Agents pick which of the account's numbers their calls
+  go out from.
+- **Multi-agent and multi-account.** Each agent gets their own SIP endpoint.
+  One backend can serve several Vobiz accounts.
+- **Two ways to sign in.** With a Vobiz account (Auth ID and Auth Token), or
+  with an existing SIP endpoint ("SIP direct").
+
+Full documentation: <https://www.vobiz.ai/docs/integrations/servicenow>
 
 ---
 
-## The one thing to understand first
+## Contents
 
-**The browser is the A leg.** The softphone sends the SIP INVITE itself; the
-backend answers `<Dial><Number>` to reach the customer.
+1. [How it works](#how-it-works)
+2. [Requirements](#requirements)
+3. [Quick start](#quick-start)
+4. [Sign in](#sign-in)
+5. [Using it](#using-it)
+6. [Configuration reference](#configuration-reference)
+7. [Deploying to production](#deploying-to-production)
+8. [Security and privacy](#security-and-privacy)
+9. [Troubleshooting](#troubleshooting)
+10. [Limitations](#limitations)
+11. [Development](#development)
+12. [Support and links](#support-and-links)
+
+---
+
+## How it works
 
 ```
-softphone ──SIP INVITE──▶ Vobiz ──answer_url──▶ backend /answer
-                                                     │
-                                              <Dial><Number> ──▶ customer
+ ServiceNow                         Your backend                     Vobiz
+ ──────────                         ────────────                     ─────
+ "Call via Vobiz" button ──POST /start-call──▶ queues the number
+ Softphone panel (OpenFrame) ◀──collects it── GET /dial-requests
+ Softphone ───────────────── SIP over WebSocket (call) ──────────────▶ registrar
+                                    /answer ◀──────── webhook ──────── Vobiz
+                                    replies <Record> + <Dial> ───────▶ dials the customer
+ interaction table ◀── Table API ── logs the call, adds the recording link
 ```
 
-The intuitive design — backend dials the customer over the REST API, then
-bridges the agent in with `<Dial><User>` — **cannot work**. Routing *into* a
-registered WebRTC endpoint is blocked platform-side: Vobiz builds a gateway URI
-it cannot itself parse and drops its own INVITE. The customer answers, hears
-ringback, then "the agent could not be reached".
+- The softphone is a WebRTC SIP phone that runs in the browser. It registers
+  with Vobiz using an endpoint the backend creates for each agent.
+- **Outbound:** the browser places the call. Vobiz asks your backend's `/answer`
+  URL what to do, and the backend replies with VobizXML that records the call
+  and dials the customer from the caller ID the agent chose.
+- **Click-to-call:** the **Call via Vobiz** button runs on the ServiceNow
+  server. It sends the record's phone number to your backend, and the agent's
+  open softphone picks it up within two seconds and dials it.
+- **Inbound:** Vobiz calls `/answer` for the incoming call, and the backend
+  rings every signed-in agent of the account that owns the number.
+- **Logging:** when a call ends, the softphone asks the backend to create the
+  `interaction` record. When the recording is ready, Vobiz notifies the backend,
+  which adds the recording link to the same record.
+- **Recordings** are played through the backend with signed, expiring links.
+  The browser never receives a Vobiz credential.
 
-Inbound is the exception: `<Dial><User>` is the only way to reach a registered
-endpoint, and it works.
+## Requirements
 
----
-
-## What talks to what
-
-| Piece | Role |
-| --- | --- |
-| `agent-phone/` | The softphone ServiceNow iframes. JsSIP stack, dialpad, incoming-call popup, call history |
-| `backend/server.js` | Answers Vobiz webhooks for every signed-in account, serves the softphone, provisions each account at sign-in, brokers the Vobiz REST API, writes to ServiceNow |
-| `backend/tunnel.js` | Starts a Cloudflare quick tunnel and records its hostname |
-| `servicenow-app/openframe/` | How to mount the softphone in the Next Experience header |
-| `servicenow-app/ui-actions/` | The **Call via Vobiz** form button — server-side, uses `sn_ws.RESTMessageV2` |
-| `servicenow-app/sys_properties/` | The two properties the UI Action reads, instead of hardcoded URLs |
-
-The backend writes the interaction record itself, over the ServiceNow Table API,
-using the instance credentials in `.env`. So the ServiceNow user you configure
-there needs write access to the `interaction` table.
-
----
-
-## Signing in: any Vobiz account
-
-No Vobiz account is configured on the backend. There is no Auth ID, Auth
-Token, SIP user, SIP password or caller-ID number in `.env`. One backend serves
-every account whose agents sign in to it. The panel has two tabs.
-
-### Vobiz account (Auth ID + Auth Token)
-
-The agent types the account's Auth ID and Auth Token, from the
-[Vobiz Console](https://console.vobiz.ai) under **API credentials**. The backend:
-
-1. **Checks the pair with Vobiz** (`GET /Account/{auth_id}/numbers`). Vobiz
-   refusing it means `401` and nothing else happens.
-2. **Finds or creates this integration's application** in that account, matched
-   on `answer_url = <PUBLIC_BASE_URL>/answer`. It never repoints an application
-   it did not create.
-3. **Finds or creates one SIP endpoint for this agent** on that account (by the
-   stored id, else by its exact alias), sets a **fresh random password** on it,
-   and binds it to the application. The binding uses `{"app_id":"<id>"}` first,
-   checks it with a GET, then falls back to the documented
-   `{"application": <id>}`. Application ids are 17 digits, so they stay strings
-   throughout. The endpoint id and the username Vobiz stored go into
-   `backend/data/endpoints.json` (mode 0600, git-ignored). No password goes there.
-4. **Loads the caller-ID dropdown** from the account's numbers (every page;
-   active, voice-enabled ones only). Outbound calls can only use a number on
-   that list.
-
-The SIP password is handed to that browser session only. The Auth Token stays in
-the backend's memory. It is never returned to the browser, never logged and
-never written to disk.
-
-**Inbound** is off until an agent presses **Enable inbound calls**. That
-attaches the selected number to the integration's application, which moves the
-number off whatever application answered it before (the panel shows which one).
-Nothing else attaches a number.
-
-### SIP direct (an endpoint you already have)
-
-The agent types an existing endpoint's SIP username and password, plus the
-number to call from (E.164). The panel registers with those credentials
-directly. The password never reaches the backend, which only records
-*SIP user → caller ID* for routing. Calls to that number ring this endpoint.
-
-SIP direct has no account credentials, so the customer sets up routing once:
-
-- **Console:** Voice → Applications → New. Set the answer URL to
-  `<PUBLIC_BASE_URL>/answer` (POST) and the hangup URL the same. Open the
-  endpoint under Voice → Endpoints and choose that application. Then open the
-  phone number and attach the same application.
-- **API equivalent:**
-  ```bash
-  # 1. the application
-  curl -X POST https://api.vobiz.ai/api/v1/Account/$AUTH_ID/Application/ \
-    -H "X-Auth-ID: $AUTH_ID" -H "X-Auth-Token: $AUTH_TOKEN" -H "Content-Type: application/json" \
-    -d '{"app_name":"ServiceNow Calling (Vobiz)","answer_url":"'$BASE'/answer","answer_method":"POST","hangup_url":"'$BASE'/answer","hangup_method":"POST"}'
-  # 2. bind the endpoint (keep the 17-digit app_id as a string)
-  curl -X POST https://api.vobiz.ai/api/v1/Account/$AUTH_ID/Endpoint/$ENDPOINT_ID/ \
-    -H "X-Auth-ID: $AUTH_ID" -H "X-Auth-Token: $AUTH_TOKEN" -H "Content-Type: application/json" \
-    -d '{"app_id":"'$APP_ID'"}'
-  # 3. route the number to it
-  curl -X POST "https://api.vobiz.ai/api/v1/Account/$AUTH_ID/numbers/%2B$DIGITS/application" \
-    -H "X-Auth-ID: $AUTH_ID" -H "X-Auth-Token: $AUTH_TOKEN" -H "Content-Type: application/json" \
-    -d '{"application_id":"'$APP_ID'"}'
-  ```
-
-Recordings, the number list and **Enable inbound calls** need the account API.
-In SIP direct they say "Sign in with your Vobiz account to use this", and the
-**Call via Vobiz** button does not reach a SIP-direct panel. Vobiz itself refuses
-a caller ID that is not on the endpoint's account.
-
-### How webhooks find the account
-
-- **Outbound** (`From=sip:<user>@…`): the SIP username identifies the agent and
-  the account. The caller ID is the `X-VH-Caller-ID` header the panel puts on
-  the INVITE, or else the number that agent selected. In account mode it must
-  be on that account's list. A SIP user nobody has signed in as gets a polite
-  `<Hangup/>`.
-- **Inbound**: the webhook's `ParentAuthID` names the account, and its signed-in
-  agents ring. Without it, the dialled number is matched against the signed-in
-  accounts' numbers, then against SIP-direct agents' numbers. `<Dial callerId>`
-  is the dialled number in E.164 (`0XXXXXXXXXX` becomes `+91XXXXXXXXXX`). No
-  match means a polite `<Hangup/>` and one log line.
-
-### After a restart
-
-Accounts, sessions and the SIP-user map live in memory. Agents sign in again.
-Their endpoints are reused, from `endpoints.json`. A recording link written into
-a ServiceNow work note names its account and is HMAC-signed for it. Until
-someone from that account signs in again after a restart, it answers "sign in
-again" instead of playing.
-
----
+- **A Vobiz account** with:
+  - its **Auth ID** and **Auth Token**, from the
+    [Vobiz Console](https://console.vobiz.ai) dashboard under **API credentials**;
+  - at least one active, voice-enabled phone number;
+  - enough balance for calls.
+- **A ServiceNow instance** where you are an administrator, with:
+  - the **OpenFrame** plugin (`com.sn_openframe`) active, for the softphone panel;
+  - the `interaction` table, where calls are logged;
+  - a user for the backend that can create and update `interaction` records and
+    read `sys_user`.
+- **A public HTTPS URL for the backend.** Vobiz and ServiceNow must both reach
+  it. For a trial, `cloudflared` gives you one in seconds
+  (`brew install cloudflared`, or `winget install --id Cloudflare.cloudflared -e`).
+- **Node.js 18 or newer.** The backend has no npm dependencies.
+- **Agents need** a current Chrome, Edge or Firefox, a microphone, and
+  permission for the softphone to use it.
 
 ## Quick start
 
+1. **Get the code.**
+
+   ```bash
+   git clone https://github.com/vobiz-ai/Vobiz-ServiceNow-Calling.git
+   cd Vobiz-ServiceNow-Calling
+   ```
+
+   There is nothing to install: the backend uses only Node's standard library.
+
+2. **Configure the backend.** Copy the example file and fill in the deployment
+   settings. Nothing about your Vobiz account goes here.
+
+   ```bash
+   cp backend/.env.example backend/.env
+   openssl rand -hex 32    # run twice: one value for each secret below
+   ```
+
+   ```env
+   PORT=8092
+   PUBLIC_BASE_URL=https://calling.example.com     # leave out when using npm run tunnel
+   SERVICENOW_INSTANCE_URL=https://your-instance.service-now.com
+   SERVICENOW_USER=vobiz.integration
+   SERVICENOW_PASSWORD=your-integration-user-password
+   VOBIZ_SHARED_SECRET=<first random value>
+   SIGNING_SECRET=<second random value>
+   ```
+
+3. **Start the backend.**
+
+   ```bash
+   npm start            # listens on http://localhost:8092
+   ```
+
+4. **Give it a public HTTPS address.** Either put it behind your own HTTPS
+   reverse proxy and set `PUBLIC_BASE_URL`, or, for a trial, run a quick tunnel
+   in a second terminal:
+
+   ```bash
+   npm run tunnel       # writes the tunnel's URL to backend/tunnel-url.txt
+   ```
+
+   The backend reads `backend/tunnel-url.txt` automatically when
+   `PUBLIC_BASE_URL` is not set.
+
+5. **Check it from outside.**
+
+   ```bash
+   BASE=https://calling.example.com     # or: BASE=$(cat backend/tunnel-url.txt)
+   curl -s "$BASE/health"
+   curl -s -X POST "$BASE/answer" -d "From=sip:test@registrar.vobiz.ai&To=91XXXXXXXXXX"
+   ```
+
+   The first returns `{"ok":true,...}` with `"publicBaseConfigured":true`. The
+   second returns a short VobizXML `<Response>` that says the phone is not
+   signed in and hangs up. That is correct: nobody has signed in yet. An HTML
+   error page instead means Vobiz cannot reach your backend either.
+
+6. **Create two system properties in ServiceNow.** Go to **System Properties →
+   All Properties** (`sys_properties.list`) and click **New** for each:
+
+   | Name | Type | Value |
+   | --- | --- | --- |
+   | `vobiz.calling.tunnel_url` | `string` | Your backend's public URL, for example `https://calling.example.com`, with no trailing slash |
+   | `vobiz.calling.shared_secret` | `password2` | The same value as `VOBIZ_SHARED_SECRET` |
+
+   Use `password2` for the secret, not `string`: anyone who can list system
+   properties can read a string property.
+
+7. **Create the "Call via Vobiz" button.** Go to **System Definition → UI
+   Actions → New**:
+
+   - **Name:** `Call via Vobiz`
+   - **Table:** `User [sys_user]` (repeat for `Contact [customer_contact]`,
+     `Incident [incident]` or `Case [sn_customerservice_case]` if you want the
+     button there too)
+   - **Form button:** checked. **Client:** unchecked. **Active**, **Show
+     insert** and **Show update:** checked.
+   - **Script:** paste the whole of
+     [`servicenow-app/ui-actions/call_via_vobiz.js`](servicenow-app/ui-actions/call_via_vobiz.js).
+     You do not need to edit it; it reads both properties at run time.
+
+8. **Add the softphone panel.** Go to **OpenFrame → Configurations → New**:
+
+   | Field | Value |
+   | --- | --- |
+   | Name | `Vobiz Softphone` |
+   | Title | `Vobiz Calling` |
+   | URL | `https://calling.example.com/agent-phone.html?instance=your-instance&agentId=<ServiceNow user name>` |
+   | Width / Height | `380` / `560` |
+   | User group | The agents who should see it |
+   | Active | checked |
+
+   `instance` is the `your-instance` part of `your-instance.service-now.com`.
+   Read [Agent identity](#agent-identity) before choosing `agentId`.
+   [`servicenow-app/openframe/openframe_config.md`](servicenow-app/openframe/openframe_config.md)
+   has the same steps.
+
+9. **Sign in and call.** Open the panel from the ServiceNow header, sign in (see
+   [Sign in](#sign-in)), allow the microphone, and wait for the badge to read
+   **READY**. Then type a number and press **Call**, or press **Call via Vobiz**
+   on a record.
+
+## Sign in
+
+The softphone has two tabs: **Vobiz account** and **SIP direct**.
+
+### Vobiz account (recommended)
+
+Enter the account's **Auth ID** (it looks like `MA_XXXXXXXX`) and **Auth
+Token**, and press **Log in**. The backend checks them with Vobiz, then sets up
+everything the account needs:
+
+- **An application** named **ServiceNow Calling (Vobiz)**, with its answer URL
+  and hangup URL set to `<your backend>/answer` (POST). If the account already
+  has an application with exactly that answer URL, it is reused. No other
+  application is changed.
+- **One SIP endpoint per agent**, attached to that application. It is reused at
+  every later sign-in, and each sign-in gives it a new random password that only
+  that browser session receives.
+- **The caller-ID list.** **Choose a caller ID** lists every active,
+  voice-enabled number on the account, and shows which application each one is
+  attached to now. Outgoing calls can only use a number on this list.
+
+Your Auth Token never leaves the backend and is never stored on disk. The
+browser gets a session token instead, which expires after 12 hours.
+
+#### Enable inbound calls
+
+Calls to your number reach the softphone only after you route them there. Pick
+the number under **Choose a caller ID**, then press **Enable inbound calls**
+under **Receive calls here**.
+
+This attaches the number to the **ServiceNow Calling (Vobiz)** application.
+**A number answers to one application at a time**, so this moves the number off
+the application it was attached to before, and calls stop going there. Before
+you press the button, the panel says what will happen ("Enabling moves
++91XXXXXXXXXX off application 12345678901234567"); afterwards it confirms where
+the number was moved from. Nothing else ever attaches a number: not sign-in, and
+not restarting the backend.
+
+### SIP direct
+
+Use this when you already have a Vobiz SIP endpoint and do not want to give the
+backend an Auth Token. Enter the endpoint's **SIP username** and **SIP
+password**, and under **Calling from** a number on the same Vobiz account in
+international format (`+91XXXXXXXXXX`). Press **Connect**.
+
+The browser registers with Vobiz using the password directly. The backend never
+receives the password and holds no account credentials; it only remembers which
+caller ID this endpoint uses, and that calls to that number ring it. You can tick
+**Remember the username and caller ID**; the password is never stored.
+
+**Before you use SIP direct**, attach the endpoint and the number to an
+application whose answer URL is your backend.
+
+In the Vobiz Console:
+
+1. **Voice → Applications → New.** Set **Answer URL** and **Hangup URL** to
+   `https://calling.example.com/answer`, method **POST**.
+2. **Voice → Endpoints**, open your endpoint, and choose that application.
+3. Open the phone number and attach the same application.
+
+Or with the API:
+
 ```bash
-npm start                                       # backend on :8092
-npm run tunnel                                  # public HTTPS, writes backend/tunnel-url.txt
+AUTH_ID=MA_XXXXXXXX
+AUTH_TOKEN=your-auth-token
+BASE=https://calling.example.com
+API="https://api.vobiz.ai/api/v1/Account/$AUTH_ID"
+H=(-H "X-Auth-ID: $AUTH_ID" -H "X-Auth-Token: $AUTH_TOKEN" -H "Content-Type: application/json")
+
+# 1. Create the application. Note the app_id in the response.
+curl -X POST "$API/Application/" "${H[@]}" -d '{
+  "app_name": "ServiceNow Calling (Vobiz)",
+  "answer_url": "'"$BASE"'/answer", "answer_method": "POST",
+  "hangup_url": "'"$BASE"'/answer", "hangup_method": "POST"}'
+
+# 2. Attach the endpoint. Send app_id as a string: it is too long for a JSON number.
+curl -X POST "$API/Endpoint/$ENDPOINT_ID/" "${H[@]}" -d '{"app_id": "'"$APP_ID"'"}'
+
+# 3. Route the number. Write the + as %2B.
+curl -X POST "$API/numbers/%2B91XXXXXXXXXX/application" "${H[@]}" \
+  -d '{"application_id": "'"$APP_ID"'"}'
 ```
 
-`cloudflared` must be on your PATH (`brew install cloudflared`,
-`winget install --id Cloudflare.cloudflared -e`). The binary is deliberately not
-committed.
+**Not available in SIP direct:** the caller-ID list, **Enable inbound calls**,
+the recordings list and recording links, and the **Call via Vobiz** button.
+These need the account's API access, so the panel says "Sign in with your Vobiz
+account to use this." Calls are still recorded in your Vobiz account and logged
+to ServiceNow, without a recording link.
 
-Then **verify before touching ServiceNow**:
+An endpoint that the backend created for a Vobiz-account sign-in cannot be used
+with SIP direct.
+
+### Agent identity
+
+The softphone identifies the agent by the `agentId` in its URL. This matters in
+three places:
+
+- **Each `agentId` gets its own SIP endpoint.** Two agents with the same
+  `agentId` share one endpoint, and each sign-in resets the other's password,
+  so the other agent's panel drops out of **READY**.
+- **Call via Vobiz** finds the agent's panel by the ServiceNow user name of the
+  person who pressed the button. It reaches your panel only if your `agentId`
+  is your ServiceNow user name.
+- **Call logging** assigns the interaction to the ServiceNow user whose user
+  name equals the `agentId`.
+
+So set `agentId` to the agent's ServiceNow user name. An OpenFrame configuration
+has one URL for everyone in its user group, so for several agents either create
+one configuration per agent (each for a group that contains only that agent), or
+have agents open the softphone in a browser tab at their own URL. Without an
+`agentId`, the browser makes up its own id and keeps it; calling and inbound
+work, but interactions are not assigned to the agent, and **Call via Vobiz**
+reaches the panel only when it is the only softphone open on the backend.
+
+## Using it
+
+### Make a call
+
+1. Wait for the badge to read **READY**. The **Call** button stays disabled
+   until then.
+2. Pick the caller ID under **Choose a caller ID** (Vobiz account sign-in only).
+3. Type the number in international format, such as `+91XXXXXXXXXX`, and press
+   **Call** or Enter.
+4. Press **Hang up** to end the call.
+
+### Call from a record
+
+Open a user, contact, incident or case and press **Call via Vobiz**. The button
+uses the record's **Mobile phone**, then **Phone**, then **Business phone**. On an
+incident it calls the **Caller**; on a case, the **Contact**.
+
+Your softphone must be open, signed in with a Vobiz account, and **READY** when
+you press the button. ServiceNow shows "Calling +91XXXXXXXXXX from your Vobiz
+panel." and the panel dials within two seconds. If the panel is already on a
+call, it does not dial. A request no panel collects expires after 30 seconds.
+
+If your instance sends OpenFrame communication events when an agent clicks a
+phone number, the panel dials those too.
+
+### Receive a call
+
+After **Enable inbound calls**, a call to the number rings every agent of that
+account who is signed in. The panel opens, plays a ring tone, and shows the
+incoming caller ID. Press **Accept** or Enter to answer, **Decline** or Escape
+to reject. If nobody from the account is signed in, the caller hears "Sorry, no
+one is available to take your call right now" and the call ends.
+
+### Call logging
+
+When a call ends, the softphone tells the backend, which creates one record in
+the ServiceNow `interaction` table through the Table API:
+
+| Field | Value |
+| --- | --- |
+| `type` | `phone` |
+| `state` | `closed_complete` |
+| `short_description` | `Vobiz Outbound Call: +91XXXXXXXXXX` (or `Inbound`) |
+| `opened_at`, `closed_at` | Start and end of the call, worked out from its duration |
+| `assigned_to` | The ServiceNow user whose user name equals the agent's `agentId`. If none matches, the work notes name the agent instead |
+| `work_notes` | Direction, from, to, duration in seconds, a **Listen to Recording** link, and a note |
+| `recording_url` | The recording link, if your `interaction` table has this field |
+
+When the recording is ready, the backend updates the same record: it fills
+`recording_url` and adds a work note with the recording link. Inbound calls
+that were missed or declined are logged too.
+
+Logging needs `SERVICENOW_INSTANCE_URL`, `SERVICENOW_USER` and
+`SERVICENOW_PASSWORD`. If any is missing, calls work but nothing is logged. The
+record is not linked to the user, incident or case the call was placed from.
+
+### Recordings
+
+Every call is recorded, as MP3, for up to an hour. The **Call recordings**
+section of the panel lists the account's 10 most recent recordings with a
+player; press the refresh icon to reload it.
+
+Recording links, in the panel and in work notes, play through your backend.
+Each link is signed for one recording on one account and expires after
+`RECORDING_URL_TTL_SECONDS`, 300 seconds by default. A link in an older work
+note stops working when it expires; play the call from the panel instead, or
+raise `RECORDING_URL_TTL_SECONDS` (see [Limitations](#limitations)).
+
+## Configuration reference
+
+The backend reads `backend/.env` at startup. Variables already set in the
+environment take precedence.
+
+| Variable | Required | Default | What it does |
+| --- | --- | --- | --- |
+| `PUBLIC_BASE_URL` | Yes, unless you use `npm run tunnel` | Contents of `backend/tunnel-url.txt` | Public HTTPS address of the backend, without a trailing slash. The answer URL Vobiz calls is `<PUBLIC_BASE_URL>/answer`. Sign-in fails until this is an `https://` URL. `PUBLIC_BASE` and `TUNNEL_URL` are accepted as alternative names |
+| `PORT` | No | `8092` | Port the backend listens on |
+| `VOBIZ_SHARED_SECRET` | Yes, for **Call via Vobiz** | none | Must equal the `vobiz.calling.shared_secret` property. Without it the button is refused. `SHARED_SECRET` is accepted as an alternative name |
+| `SIGNING_SECRET` | Yes, in production | Random at each start | Signs recording links. If unset, every link stops working when the backend restarts |
+| `RECORDING_URL_TTL_SECONDS` | No | `300` | How long a recording link stays valid, in seconds |
+| `SERVICENOW_INSTANCE_URL` | Yes, for call logging | none | Your instance, such as `https://your-instance.service-now.com` |
+| `SERVICENOW_USER` | Yes, for call logging | none | ServiceNow user the backend logs calls as |
+| `SERVICENOW_PASSWORD` | Yes, for call logging | none | That user's password (HTTP basic authentication) |
+| `DATA_DIR` | No | `backend/data` | Where the backend keeps `endpoints.json`, the map of which SIP endpoint belongs to which agent on which account |
+| `ALLOWED_ORIGINS` | No | none | Extra browser origins allowed to call the backend, comma-separated. `https://*.service-now.com` and `localhost` are always allowed |
+| `VOBIZ_API_URL` | No | `https://api.vobiz.ai` | Vobiz API base URL. Leave the default |
+| `VOBIZ_REGISTRAR` | No | `registrar.vobiz.ai` | Vobiz SIP registrar. Leave the default; the softphone always uses `registrar.vobiz.ai` |
+| `ENV_FILE` | No | `backend/.env` | Load settings from a different file. Set it in the environment, not in `.env` |
+
+`backend/agents.json` optionally sets a display name for each `agentId`:
+
+```json
+{ "jane.doe": { "displayName": "Jane Doe" } }
+```
+
+ServiceNow reads two system properties: `vobiz.calling.tunnel_url` (your
+backend's public URL) and `vobiz.calling.shared_secret` (equal to
+`VOBIZ_SHARED_SECRET`). See
+[`servicenow-app/sys_properties/properties_guide.md`](servicenow-app/sys_properties/properties_guide.md).
+
+## Deploying to production
+
+- **Use a stable HTTPS hostname** behind a reverse proxy or load balancer, and
+  set `PUBLIC_BASE_URL`. A quick tunnel gets a new hostname every time it
+  starts. When the hostname changes, update `PUBLIC_BASE_URL`, the
+  `vobiz.calling.tunnel_url` property and the OpenFrame URL; have agents sign in
+  again so the application is set up for the new answer URL; and press **Enable
+  inbound calls** again.
+- **Run exactly one instance.** Sessions, signed-in accounts and in-progress
+  calls are held in memory, so a second instance behind a load balancer would
+  not know about calls the first one started.
+- **Keep `DATA_DIR` on persistent storage.** It lets agents get the same SIP
+  endpoint after a restart or redeploy instead of a new one each time.
+- **Set `SIGNING_SECRET` and `VOBIZ_SHARED_SECRET`** to long random values
+  (`openssl rand -hex 32`), and keep `backend/.env` out of version control.
+- **Restarts sign everyone out.** Plan restarts outside working hours; agents
+  sign in again afterwards.
+- **Use a dedicated ServiceNow user** for `SERVICENOW_USER`, with only the
+  access it needs: create and update on `interaction`, read on `sys_user`.
+- **Keep your ServiceNow artifacts in an update set.** Create the two system
+  properties, the UI Action and the OpenFrame configuration in an update set on
+  a sub-production instance, then move it to production.
+- If you serve the softphone from a domain other than `*.service-now.com` or
+  your backend, add it to `ALLOWED_ORIGINS`.
+
+## Security and privacy
+
+- **Your Auth Token stays on the backend.** It is checked with Vobiz at sign-in,
+  kept in memory only, and never logged, written to disk or sent to the browser.
+- **Nothing secret is stored on disk.** `endpoints.json` holds endpoint ids and
+  SIP usernames only, with file mode 0600. `backend/.env` holds your ServiceNow
+  credentials and the two secrets.
+- **The browser receives** a session token, the Auth ID, the account's phone numbers, and the
+  SIP username and password of its own endpoint, which change at every sign-in.
+  In SIP direct, the password the agent types stays in the browser.
+- **Recording links are signed and expire.** Each link works for one recording
+  on one account until it expires. The backend fetches audio only from Vobiz
+  hosts, and never from an address supplied in a request.
+- **Click-to-call is authenticated.** `/start-call` requires the shared secret
+  from ServiceNow or a signed-in session. Outgoing caller IDs must be numbers on
+  the signed-in account.
+- **Only allowed origins** (`*.service-now.com`, `localhost` and
+  `ALLOWED_ORIGINS`) can call the backend from a browser.
+- **`/health` shows only counts** and whether settings are present, never
+  account ids, numbers or usernames.
+- **Webhooks are not signature-checked.** The backend acts on a Vobiz webhook
+  only for SIP users and numbers of accounts signed in to it.
+- **Recordings are visible across the account.** Any agent signed in with an
+  account sees that account's recent recordings in the panel, and anyone who can
+  read an interaction's work notes can play its recording until the link
+  expires.
+
+To report a security issue, see [SECURITY.md](SECURITY.md).
+
+## Troubleshooting
+
+The backend log shows each call: `WEBHOOK /answer received`, then the dial
+result (`DIAL RESULT status=... bleg=...`) and `RECORDING READY`. If `bleg` is
+`(none)`, the customer's leg was never created.
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| Sign-in says "Vobiz did not accept this Auth ID and Auth Token" | Wrong or mistyped credentials | Copy both from the Vobiz Console under **API credentials** |
+| Sign-in says "Could not reach Vobiz to check these credentials" | The backend cannot reach `api.vobiz.ai` | Check the backend host's outbound internet access |
+| Sign-in says "This backend has no public HTTPS address" | `PUBLIC_BASE_URL` is unset and no tunnel is running | Set `PUBLIC_BASE_URL` to an `https://` URL, or run `npm run tunnel` |
+| Sign-in says "could not set up calling on this account" | Vobiz refused to create the application or the endpoint | The message names the step. Check the account is active and try again |
+| Caller-ID list says "No numbers found on this account" | The account has no active, voice-enabled number | Buy or activate a number in the Console, then sign in again |
+| Badge never reads **READY**, or shows "Registration failed" | The browser cannot reach `registrar.vobiz.ai` on port 5063, or another panel signed in with the same `agentId` | Allow secure WebSockets to `registrar.vobiz.ai:5063` through your network, and give each agent their own `agentId` |
+| "No microphone access" or "Microphone permission was denied" | The page is not served over HTTPS, or the browser blocked the microphone | Open the panel over HTTPS and allow the microphone. If the ServiceNow frame blocks it, open the softphone URL in its own tab |
+| SIP direct never reaches **READY** | Wrong SIP username or password | Check the endpoint's credentials in the Console |
+| Outbound call ends at once with "This phone is not signed in" | The backend restarted, or the session expired | Sign in again |
+| Call via Vobiz: "Status 401" | `vobiz.calling.shared_secret` is empty or differs from `VOBIZ_SHARED_SECRET` | Set both to the same value |
+| Call via Vobiz: "Status 409 ... No Vobiz panel is open and signed in" | No softphone is open and signed in with a Vobiz account | Open the panel, sign in on **Vobiz account**, wait for **READY**, press the button again |
+| Call via Vobiz: "Status 409 ... No open Vobiz panel is signed in as ..." | Your panel's `agentId` is not your ServiceNow user name | See [Agent identity](#agent-identity) |
+| Call via Vobiz: "set the system property 'vobiz.calling.tunnel_url'" | Property missing or not `https://` | Create it with your backend's public URL |
+| Calls to your number are not answered, or reach another system | The number is not attached to this integration's application | Sign in and press **Enable inbound calls** for that number |
+| Caller hears "no one is available" | Nobody from that account is signed in | Have an agent sign in and wait for **READY** |
+| Everything stopped after a restart of the tunnel | The quick-tunnel hostname changed | Update the property and OpenFrame URL, sign in again, press **Enable inbound calls** again |
+| No interaction records appear | ServiceNow settings missing, or the user lacks access | Set all three `SERVICENOW_*` variables; the backend log shows `ServiceNow refused the interaction (HTTP 403)` if access is missing |
+| Recording link says "invalid or has expired" | The link is older than `RECORDING_URL_TTL_SECONDS`, or `SIGNING_SECRET` changed | Play the call from the panel; set `SIGNING_SECRET` and a longer TTL |
+| Recording link asks you to sign in again | The backend restarted and nobody from that account has signed in since | Sign in with that account, then open the link |
+| One-way or no audio | The network blocks the media path | Try another network; allow WebRTC media (UDP) through your firewall |
+
+More detail: [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
+
+## Limitations
+
+- **Restarting the backend signs everyone out.** Agents must sign in again, and
+  recording links for an account play only after someone from it signs in.
+- **Run one backend instance.** State is held in memory.
+- **Sessions last 12 hours**, after which agents sign in again.
+- **Recording links in work notes expire** after `RECORDING_URL_TTL_SECONDS`
+  (5 minutes by default). Raising it keeps them playable longer, for anyone who
+  can see the work note.
+- **SIP direct** has no caller-ID list, inbound setup, recording playback or
+  **Call via Vobiz**.
+- **Call via Vobiz needs the agent's panel open and READY**, and reaches the
+  right panel only when `agentId` is the agent's ServiceNow user name.
+- **Interactions are not linked** to the record the call was made from.
+- **One call at a time** per panel. There is no hold, transfer or mute.
+- **Limits per call:** 30 seconds of ringing, 4 hours of talk, and 1 hour of
+  recording.
+
+## Development
 
 ```bash
-BASE=$(cat backend/tunnel-url.txt)
-
-curl -s "$BASE/health"
-curl -s -X POST "$BASE/answer" \
-  -d "From=sip:x@registrar.vobiz.ai&To=91XXXXXXXXXX&RouteType=sip"
+npm test             # runs the suite against a mock Vobiz API and a mock ServiceNow
+npm start            # backend on :8092
+npm run tunnel       # Cloudflare quick tunnel; needs cloudflared on your PATH
 ```
 
-The second must return VobizXML: `<Response>` with a `<Speak>` and `<Hangup/>`,
-because nobody has signed in as `sip:x` (a signed-in agent's SIP user gets
-`<Dial …><Number>`). Anything else, such as a tunnel error page or an ngrok
-interstitial, means every call dies silently.
-
-**If the tunnel hostname changed**, three things go stale together:
-
-1. `PUBLIC_BASE_URL` in `backend/.env` (or `backend/tunnel-url.txt`, written for you)
-2. each account's application — sign in again from the softphone, which finds or
-   creates the application for the new `/answer` URL and rebinds the agent's
-   endpoint; press **Enable inbound calls** again for the inbound number. SIP-direct
-   customers update their application's answer URL in the Console.
-3. `vobiz.calling.tunnel_url` in ServiceNow `sys_properties`, and the OpenFrame
-   configuration URL
-
-This is the single most common cause of "it stopped working".
-
----
-
-## Making a call
-
-**From the softphone.** Open the OpenFrame panel, sign in (either tab, see
-above), pick the caller ID, allow the microphone, and **wait for the status to
-read Ready**. That is the SIP registration landing; dialling before it rings the
-customer into silence.
-
-**From a record.** The **Call via Vobiz** UI Action on `sys_user` (or
-`incident`, `sn_customerservice_case`) posts the record's number to
-`/start-call`. The backend does not dial it: it hands the number to your open,
-signed-in softphone, which places the call from the browser like any other —
-so the panel must be open, signed in with the Vobiz account, and **Ready**
-when you press the button. It requires
-`vobiz.calling.shared_secret` to be set and to match `VOBIZ_SHARED_SECRET` in
-`backend/.env`.
-
-**Inbound.** Press **Enable inbound calls** once for the number, then call it. The softphone rings,
-shows the caller, and Accept/Decline are wired to Enter/Escape.
-
----
-
-## Reading the logs
-
-The backend log is the honest account of what happened:
+The suite never reads your `backend/.env` and never places a real call. CI also
+checks that no credentials are committed.
 
 ```
-WEBHOOK /answer received: CallUUID=… From=sip:… To=+1…
-  -> Browser is A-leg: dialing out to 91… as callerId=+91…
-DIAL RESULT status=completed ring=true cause=NORMAL_CLEARING bleg=abc-123 dur=42
-RECORDING READY call=… id=…
+agent-phone/            the softphone (HTML, CSS, JavaScript, vendored JsSIP)
+backend/server.js       the backend: webhooks, sign-in, recordings, ServiceNow logging
+backend/tunnel.js       starts a Cloudflare quick tunnel
+backend/test-harness.js the test suite
+backend/agents.json     optional display names per agentId
+servicenow-app/         the UI Action script, system properties and OpenFrame setup
+docs/                   architecture, HTTP API reference and troubleshooting
 ```
 
-**`DialBLegUUID` is the single most useful field in this stack.** Present means
-the call connected. Empty means no B leg was ever created, whatever the UI said.
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-Symptom-driven debugging lives in [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md).
+## Support and links
 
----
+- Vobiz documentation: <https://www.vobiz.ai/docs>
+- This integration: <https://www.vobiz.ai/docs/integrations/servicenow>
+- HTTP API: [docs/API_SPECIFICATION.md](docs/API_SPECIFICATION.md)
+- Support: `support@vobiz.ai`
 
-## Security
+## License
 
-This service holds, in memory, the Auth Token of every account signed in to it,
-plus your ServiceNow instance credentials, and it is reachable from the internet because
-Vobiz has to call its webhooks. It is built accordingly.
-
-- **Recording playback is HMAC-signed with a short expiry.** The endpoint takes
-  a recording *id*, resolves the media URL server-side, and refuses any host off
-  an allowlist — before the request and again after every redirect. Never add a
-  caller-supplied URL here: with account credentials attached, that hands them
-  to whatever host is named.
-- **`/agent` is session-gated** and serves only that session's own endpoint and
-  the password set at that sign-in. `agents.json` holds display names only, and
-  `endpoints.json` holds ids only.
-- **Sign-in proves the credentials** against Vobiz, and the browser holds an
-  opaque session token rather than the Auth Token. The token is never in an HTTP
-  response, a log line or a file.
-- **Recording links are account-scoped.** The HMAC covers the account and the id,
-  so a link for one account's recording can never fetch another's.
-- **CORS is an allowlist** — `*.service-now.com`, localhost, and anything in
-  `ALLOWED_ORIGINS`.
-- **`/health` reports whether things are configured, never what they are.**
-- **`/start-call` requires the shared secret or an account session**, because
-  it makes the agent's softphone place a billed call. It never dials from the
-  backend.
-- **In account mode, caller ID must be on the account's number list**, whether it
-  comes from the dropdown or the `X-VH-Caller-ID` header.
-- **A SIP-direct session covers that endpoint's own calls only.** Recordings,
-  provisioning, caller-ID selection and click-to-call need an account sign-in.
-  SIP direct cannot take over an endpoint that an account sign-in provisioned.
-
-Two settings worth getting right before you go live: set `SIGNING_SECRET`
-explicitly, or playback links stop working at every restart, and set
-`VOBIZ_SHARED_SECRET` with the matching ServiceNow property, or the form button
-cannot place calls.
-
-Found a problem? `support@vobiz.ai` — see [SECURITY.md](SECURITY.md).
-
----
-
-## Tests
-
-```bash
-npm test
-```
-
-Starts a backend against a mock Vobiz API and a mock ServiceNow Table API —
-never your real `backend/.env` or instance — drives both call directions through
-`/answer`, and signs in two unrelated fake accounts plus a SIP-direct endpoint.
-It checks per-account provisioning, including the exact 17-digit app id in
-the bind body. It checks that webhooks route to the right account, that a wrong
-token is refused, that recording links are account-scoped and that no Auth Token
-appears in any response or log. It also covers the CDR ledger, the
-one-record-per-call write-back, the click-to-call hand-off and the security
-properties above. It exits non-zero when any of that stops being true.
-
-It does not place a real call. Before rolling out, make one outbound and one
-inbound call on your own account and confirm two-way audio.
-
----
-
-## Licence
-
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
